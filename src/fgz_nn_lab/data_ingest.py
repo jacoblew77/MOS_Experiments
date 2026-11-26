@@ -170,17 +170,24 @@ def fetch_iem_coop_observations(
     return qc_df
 
 
-def _request_open_meteo_json(url: str, params: dict[str, Any], retries: int = 4) -> dict[str, Any]:
-    delay = 1.5
+def _request_open_meteo_json(url: str, params: dict[str, Any], retries: int = 5) -> dict[str, Any]:
+    delay = 2.0
     for attempt in range(retries):
-        resp = requests.get(url, params=params, timeout=90)
-        if resp.status_code == 200:
-            return resp.json()
-        if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-            time.sleep(delay)
-            delay *= 2.0
-            continue
-        resp.raise_for_status()
+        try:
+            resp = requests.get(url, params=params, timeout=(15, 150))
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(delay)
+                delay = min(delay * 2.0, 30.0)
+                continue
+            resp.raise_for_status()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < retries - 1:
+                time.sleep(delay)
+                delay = min(delay * 2.0, 30.0)
+                continue
+            raise
     raise RuntimeError(f"Open-Meteo request failed for {url}")
 
 
@@ -193,7 +200,7 @@ def _fetch_chunked_hourly(
     hourly_vars: list[str],
     extra_params: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, float]:
-    """Fetch hourly series in 2-year chunks with elevation=nan to preserve true grid elevation."""
+    """Fetch hourly series in 1-year chunks with elevation=nan to preserve true grid elevation."""
     dt_start = pd.Timestamp(start_date)
     dt_end = pd.Timestamp(end_date)
     frames: list[pd.DataFrame] = []
@@ -201,7 +208,7 @@ def _fetch_chunked_hourly(
 
     cur = dt_start
     while cur <= dt_end:
-        chunk_end = min(cur + pd.DateOffset(years=2) - pd.Timedelta(days=1), dt_end)
+        chunk_end = min(cur + pd.DateOffset(years=1) - pd.Timedelta(days=1), dt_end)
         params: dict[str, Any] = {
             "latitude": lat,
             "longitude": lon,
@@ -230,7 +237,7 @@ def _fetch_chunked_hourly(
                 cdf[v] = np.nan
         frames.append(cdf)
         cur = chunk_end + pd.Timedelta(days=1)
-        time.sleep(0.25)
+        time.sleep(0.6)
 
     full_df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["time_utc"]).sort_values("time_utc")
     full_df["grid_elev_m"] = grid_elev_m
@@ -278,7 +285,6 @@ def fetch_hourly_predictors_for_stations(
                 )
             else:
                 model_code = NWP_MODELS[src]
-                # Some regional models omit certain levels; fall back cleanly if HTTP 400 occurs
                 try:
                     df_st, _ = _fetch_chunked_hourly(
                         url=OPEN_METEO_HIST_FORECAST_URL,
