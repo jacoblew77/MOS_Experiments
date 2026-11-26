@@ -1,0 +1,96 @@
+name: FGZ COOP 5-Day NN Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Pipeline stage to execute"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - ingest
+          - baselines
+          - train-nn
+          - ablations
+          - all
+      source_mode:
+        description: "Predictor archive mode"
+        required: true
+        default: "era5"
+        type: choice
+        options:
+          - era5
+          - nwp_hybrid
+      fast_smoke:
+        description: "Run fast smoke window (3 stations, 2 years)"
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/nn_experiment.yml"
+
+jobs:
+  test-and-train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install CPU PyTorch and package dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -e ".[dev]"
+
+      - name: Run leakage, QC, and alignment unit tests
+        run: pytest -v
+
+      - name: Restore cached COOP and NWP Parquet extracts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: fgz-nn-raw-v1-${{ inputs.source_mode }}-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}
+          restore-keys: |
+            fgz-nn-raw-v1-${{ inputs.source_mode }}-
+
+      - name: Execute experiment pipeline
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          SMOKE_FLAG=""
+          if [ "${{ inputs.fast_smoke }}" = "true" ]; then
+            SMOKE_FLAG="--fast-smoke"
+          fi
+          python scripts/run_pipeline.py \
+            --stage "${{ inputs.stage }}" \
+            --source-mode "${{ inputs.source_mode }}" \
+            $SMOKE_FLAG
+
+      - name: Print leaderboard to job summary
+        if: github.event_name == 'workflow_dispatch' && hashFiles('data/runs/leaderboard.csv') != ''
+        run: |
+          echo "## FGZ COOP 5-Day Min/Max T MAE Leaderboard (°F)" >> $GITHUB_STEP_SUMMARY
+          echo '```csv' >> $GITHUB_STEP_SUMMARY
+          cat data/runs/leaderboard.csv >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload run leaderboard and stratified MAE slices
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fgz-nn-metrics-${{ github.run_number }}
+          path: data/runs/
+          retention-days: 7

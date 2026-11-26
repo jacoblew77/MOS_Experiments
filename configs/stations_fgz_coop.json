@@ -1,0 +1,108 @@
+{
+  "_network": "AZCLIMATE",
+  "_notes": "Curated active long-record FGZ COOP stations; AZ6471 Phantom Ranch corrected to 2530 ft.",
+  "elevation_overrides_ft": {
+    "AZ6471": 2530.0
+  },
+  "stations": [
+    {
+      "station_id": "AZ0678",
+      "name": "Bellemont WFO Flagstaff",
+      "lat": 35.2372,
+      "lon": -111.8222,
+      "elev_ft": 7152.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 7
+    },
+    {
+      "station_id": "AZ3010",
+      "name": "Flagstaff Area",
+      "lat": 35.1444,
+      "lon": -111.6664,
+      "elev_ft": 7003.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 7
+    },
+    {
+      "station_id": "AZ6471",
+      "name": "Phantom Ranch",
+      "lat": 36.1056,
+      "lon": -112.0950,
+      "elev_ft": 2530.0,
+      "tier": "canyon",
+      "obs_hour_mst": 8
+    },
+    {
+      "station_id": "AZ3596",
+      "name": "Grand Canyon NP",
+      "lat": 36.0531,
+      "lon": -112.1472,
+      "elev_ft": 6785.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 8
+    },
+    {
+      "station_id": "AZ7435",
+      "name": "Saint Johns",
+      "lat": 34.5106,
+      "lon": -109.3653,
+      "elev_ft": 5790.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 8
+    },
+    {
+      "station_id": "AZ6796",
+      "name": "Prescott",
+      "lat": 34.5706,
+      "lon": -112.4319,
+      "elev_ft": 5205.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 7
+    },
+    {
+      "station_id": "AZ9359",
+      "name": "Winslow Area",
+      "lat": 35.0278,
+      "lon": -110.7225,
+      "elev_ft": 4888.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 7
+    },
+    {
+      "station_id": "AZ6328",
+      "name": "Payson",
+      "lat": 34.2308,
+      "lon": -111.3392,
+      "elev_ft": 4915.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 8
+    },
+    {
+      "station_id": "AZ7720",
+      "name": "Show Low City",
+      "lat": 34.2544,
+      "lon": -110.0297,
+      "elev_ft": 6348.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 8
+    },
+    {
+      "station_id": "AZ8214",
+      "name": "Seligman",
+      "lat": 35.3256,
+      "lon": -112.8778,
+      "elev_ft": 5250.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 8
+    },
+    {
+      "station_id": "AZ9439",
+      "name": "Wupatki NM",
+      "lat": 35.5181,
+      "lon": -111.3703,
+      "elev_ft": 4908.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 8
+    }
+  ]
+}
