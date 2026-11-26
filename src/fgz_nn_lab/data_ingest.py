@@ -170,22 +170,27 @@ def fetch_iem_coop_observations(
     return qc_df
 
 
-def _request_open_meteo_json(url: str, params: dict[str, Any], retries: int = 5) -> dict[str, Any]:
-    delay = 2.0
+def _request_open_meteo_json(
+    url: str,
+    params: dict[str, Any],
+    retries: int = 7,
+    read_timeout: int = 180,
+) -> dict[str, Any]:
+    delay = 2.5
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, timeout=(15, 150))
+            resp = requests.get(url, params=params, timeout=(20, read_timeout))
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(delay)
-                delay = min(delay * 2.0, 30.0)
+                delay = min(delay * 2.0, 40.0)
                 continue
             resp.raise_for_status()
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             if attempt < retries - 1:
                 time.sleep(delay)
-                delay = min(delay * 2.0, 30.0)
+                delay = min(delay * 2.0, 40.0)
                 continue
             raise
     raise RuntimeError(f"Open-Meteo request failed for {url}")
@@ -199,8 +204,11 @@ def _fetch_chunked_hourly(
     end_date: str,
     hourly_vars: list[str],
     extra_params: dict[str, Any] | None = None,
+    chunk_months: int = 12,
+    sleep_sec: float = 0.6,
+    read_timeout: int = 180,
 ) -> tuple[pd.DataFrame, float]:
-    """Fetch hourly series in 1-year chunks with elevation=nan to preserve true grid elevation."""
+    """Fetch hourly series in date chunks with elevation=nan to preserve true grid elevation."""
     dt_start = pd.Timestamp(start_date)
     dt_end = pd.Timestamp(end_date)
     frames: list[pd.DataFrame] = []
@@ -208,7 +216,7 @@ def _fetch_chunked_hourly(
 
     cur = dt_start
     while cur <= dt_end:
-        chunk_end = min(cur + pd.DateOffset(years=1) - pd.Timedelta(days=1), dt_end)
+        chunk_end = min(cur + pd.DateOffset(months=chunk_months) - pd.Timedelta(days=1), dt_end)
         params: dict[str, Any] = {
             "latitude": lat,
             "longitude": lon,
@@ -224,7 +232,7 @@ def _fetch_chunked_hourly(
         if extra_params:
             params.update(extra_params)
 
-        payload = _request_open_meteo_json(url, params)
+        payload = _request_open_meteo_json(url, params, retries=7, read_timeout=read_timeout)
         if np.isnan(grid_elev_m) and "elevation" in payload and payload["elevation"] is not None:
             grid_elev_m = float(payload["elevation"])
 
@@ -237,7 +245,7 @@ def _fetch_chunked_hourly(
                 cdf[v] = np.nan
         frames.append(cdf)
         cur = chunk_end + pd.Timedelta(days=1)
-        time.sleep(0.6)
+        time.sleep(sleep_sec)
 
     full_df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["time_utc"]).sort_values("time_utc")
     full_df["grid_elev_m"] = grid_elev_m
@@ -257,6 +265,8 @@ def fetch_hourly_predictors_for_stations(
     source_mode='nwp_hybrid' fetches ERA5 + archived HRRR, GFS, and ECMWF IFS runs.
     """
     raw_dir.mkdir(parents=True, exist_ok=True)
+    st_cache_dir = raw_dir / "per_station"
+    st_cache_dir.mkdir(parents=True, exist_ok=True)
     pad_end = (pd.Timestamp(end_date) + pd.Timedelta(days=6)).strftime("%Y-%m-%d")
 
     sources_to_pull = ["era5"]
@@ -274,6 +284,11 @@ def fetch_hourly_predictors_for_stations(
         st_frames: list[pd.DataFrame] = []
         for _, st in stations_df.iterrows():
             sid = st["station_id"]
+            one_st_cache = st_cache_dir / f"hourly_{src}_{sid}_{start_date}_{pad_end}.parquet"
+            if one_st_cache.exists():
+                st_frames.append(pd.read_parquet(one_st_cache))
+                continue
+
             if src == "era5":
                 df_st, _ = _fetch_chunked_hourly(
                     url=OPEN_METEO_ARCHIVE_URL,
@@ -282,6 +297,9 @@ def fetch_hourly_predictors_for_stations(
                     start_date=start_date,
                     end_date=pad_end,
                     hourly_vars=ERA5_HOURLY_VARS,
+                    chunk_months=12,
+                    sleep_sec=0.6,
+                    read_timeout=180,
                 )
             else:
                 model_code = NWP_MODELS[src]
@@ -294,6 +312,9 @@ def fetch_hourly_predictors_for_stations(
                         end_date=pad_end,
                         hourly_vars=NWP_HOURLY_VARS_BASE,
                         extra_params={"models": model_code},
+                        chunk_months=3,
+                        sleep_sec=1.2,
+                        read_timeout=180,
                     )
                 except requests.HTTPError:
                     minimal_vars = [
@@ -312,12 +333,16 @@ def fetch_hourly_predictors_for_stations(
                         end_date=pad_end,
                         hourly_vars=minimal_vars,
                         extra_params={"models": model_code},
+                        chunk_months=3,
+                        sleep_sec=1.2,
+                        read_timeout=180,
                     )
                     for missing_col in NWP_HOURLY_VARS_BASE:
                         if missing_col not in df_st.columns:
                             df_st[missing_col] = np.nan
 
             df_st["station_id"] = sid
+            df_st.to_parquet(one_st_cache, index=False)
             st_frames.append(df_st)
 
         full_src_df = pd.concat(st_frames, ignore_index=True)
