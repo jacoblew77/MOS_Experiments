@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 MST_OFFSET_HOURS = -7  # Arizona stays on MST (UTC-7) all year
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
 @dataclass
@@ -25,10 +31,11 @@ class TensorBundle:
 
 def _aggregate_daily_windows(hourly_df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     """
-    Aggregates sub-daily hourly NWP/reanalysis steps into MST physical windows:
+    Vectorized aggregation of sub-daily hourly NWP/reanalysis steps into MST physical windows:
       - Min T window: 00:00..09:00 MST (overnight decoupling, radiative cooling, drainage)
       - Max T window: 10:00..18:00 MST (daytime PBL mixing, solar heating, afternoon moisture)
     """
+    t0 = time.monotonic()
     df = hourly_df.copy()
     local_time = df["time_utc"] + pd.Timedelta(hours=MST_OFFSET_HOURS)
     df["target_date"] = local_time.dt.floor("D")
@@ -54,9 +61,9 @@ def _aggregate_daily_windows(hourly_df: pd.DataFrame, prefix: str) -> pd.DataFra
     min_win = df[(df["hour_mst"] >= 0) & (df["hour_mst"] <= 9)]
     max_win = df[(df["hour_mst"] >= 10) & (df["hour_mst"] <= 18)]
 
-    g_min = min_win.groupby(["station_id", "target_date"], as_index=False).agg(
+    grp_min = min_win.groupby(["station_id", "target_date"], sort=False)
+    g_min = grp_min.agg(
         t2m_min_win=("temperature_2m", "min"),
-        t2m_p10_min_win=("temperature_2m", lambda x: np.nanpercentile(x, 10) if x.notna().any() else np.nan),
         t2m_mean_min_win=("temperature_2m", "mean"),
         td2m_min_win=("dew_point_2m", "min"),
         dp_spread_min_win=("dp_spread", "min"),
@@ -70,10 +77,12 @@ def _aggregate_daily_windows(hourly_df: pd.DataFrame, prefix: str) -> pd.DataFra
         t700_min_win=("temperature_700hPa", "mean"),
         grid_elev_m=("grid_elev_m", "first"),
     )
+    g_min["t2m_p10_min_win"] = grp_min["temperature_2m"].quantile(0.10)
+    g_min = g_min.reset_index()
 
-    g_max = max_win.groupby(["station_id", "target_date"], as_index=False).agg(
+    grp_max = max_win.groupby(["station_id", "target_date"], sort=False)
+    g_max = grp_max.agg(
         t2m_max_win=("temperature_2m", "max"),
-        t2m_p90_max_win=("temperature_2m", lambda x: np.nanpercentile(x, 90) if x.notna().any() else np.nan),
         t2m_mean_max_win=("temperature_2m", "mean"),
         td2m_max_win=("dew_point_2m", "mean"),
         dp_spread_max_win=("dp_spread", "max"),
@@ -89,6 +98,8 @@ def _aggregate_daily_windows(hourly_df: pd.DataFrame, prefix: str) -> pd.DataFra
         t700_max_win=("temperature_700hPa", "mean"),
         lapse_700_500_max_win=("lapse_700_500", "mean"),
     )
+    g_max["t2m_p90_max_win"] = grp_max["temperature_2m"].quantile(0.90)
+    g_max = g_max.reset_index()
 
     merged = pd.merge(g_min, g_max, on=["station_id", "target_date"], how="inner")
     rename_map = {
@@ -97,7 +108,13 @@ def _aggregate_daily_windows(hourly_df: pd.DataFrame, prefix: str) -> pd.DataFra
         if c not in ("station_id", "target_date", "grid_elev_m")
     }
     rename_map["grid_elev_m"] = f"{prefix}_grid_elev_m"
-    return merged.rename(columns=rename_map)
+    out = merged.rename(columns=rename_map)
+    print(
+        f"  [{_ts()}] [windows] Aggregated {prefix.upper():4s} sub-daily windows -> "
+        f"{len(out):,} station-days in {time.monotonic() - t0:.1f}s",
+        flush=True,
+    )
+    return out
 
 
 def compute_causal_obs_lags(
@@ -108,16 +125,8 @@ def compute_causal_obs_lags(
     afternoon_max_gate_utc: int = 23,
     min_causal_lag_hours: int = 48,
 ) -> pd.DataFrame:
-    """
-    Computes strictly causal observation lag features per station for a forecast issued at
-    (issue_date, issue_hour_utc).
-    Respects both explicit UTC gating rules AND min_causal_lag_hours safety floor.
-    """
     issue_ts_utc = pd.Timestamp(issue_date) + pd.Timedelta(hours=issue_hour_utc)
 
-    # For any historical obs_date D:
-    # Morning Min on date D becomes gated at D + morning_min_gate_utc hours.
-    # Afternoon Max on date D becomes gated at D + afternoon_max_gate_utc hours.
     min_ready_cutoff = issue_ts_utc - pd.Timedelta(hours=max(0, min_causal_lag_hours - morning_min_gate_utc))
     max_ready_cutoff = issue_ts_utc - pd.Timedelta(hours=max(0, min_causal_lag_hours - afternoon_max_gate_utc))
 
@@ -129,7 +138,7 @@ def compute_causal_obs_lags(
     valid_max = df[(df["max_gate_ts"] <= issue_ts_utc) & (df["max_gate_ts"] <= max_ready_cutoff)]
 
     rows = []
-    for sid, grp_all in df.groupby("station_id"):
+    for sid, _ in df.groupby("station_id"):
         g_min = valid_min[valid_min["station_id"] == sid].sort_values("obs_date")
         g_max = valid_max[valid_max["station_id"] == sid].sort_values("obs_date")
 
@@ -166,11 +175,7 @@ def build_aligned_tensors(
     afternoon_max_gate_utc: int = 23,
     min_causal_lag_hours: int = 48,
 ) -> TensorBundle:
-    """
-    Builds (N, 5, C_dyn) dynamic sequence tensors, explicit masks, static site/DOY context,
-    lapse-adjusted baseline anchors, and 5-day COOP targets (d = 1..5, where d=1 is issue_date).
-    Enforces HRRR 48-hour horizon masking (masked out for d >= 3).
-    """
+    t_start = time.monotonic()
     daily_sources: dict[str, pd.DataFrame] = {}
     for src_name, hdf in hourly_by_source.items():
         daily_sources[src_name] = _aggregate_daily_windows(hdf, prefix=src_name)
@@ -187,7 +192,6 @@ def build_aligned_tensors(
             how="left",
         )
 
-    # Compute multi-model spread when both GFS and IFS are present
     if "gfs_t2m_min_win" in base_daily.columns and "ifs_t2m_min_win" in base_daily.columns:
         base_daily["ens_spread_tmin"] = (base_daily["gfs_t2m_min_win"] - base_daily["ifs_t2m_min_win"]).abs()
         base_daily["ens_spread_tmax"] = (base_daily["gfs_t2m_max_win"] - base_daily["ifs_t2m_max_win"]).abs()
@@ -209,14 +213,21 @@ def build_aligned_tensors(
     ]
     all_dyn_names = dyn_cols + causal_cols
 
-    coop_indexed = coop_df.set_index(["station_id", "obs_date"]).sort_index()
-    dyn_indexed = base_daily.set_index(["station_id", "target_date"]).sort_index()
     st_meta = stations_df.set_index("station_id")
+    tier_codes = {
+        "basin_plateau": [1.0, 0.0, 0.0],
+        "rim_slope": [0.0, 1.0, 0.0],
+        "canyon": [0.0, 0.0, 1.0],
+    }
 
-    tier_codes = {"basin_plateau": [1.0, 0.0, 0.0], "rim_slope": [0.0, 1.0, 0.0], "canyon": [0.0, 0.0, 1.0]}
-
-    # Pre-index COOP arrays per station for fast vectorized causal lookup
-    coop_by_sid = {sid: g.sort_values("obs_date").reset_index(drop=True) for sid, g in coop_df.groupby("station_id")}
+    coop_by_sid = {
+        sid: g.sort_values("obs_date").reset_index(drop=True)
+        for sid, g in coop_df.groupby("station_id")
+    }
+    dyn_by_sid = {
+        sid: g.sort_values("target_date").reset_index(drop=True)
+        for sid, g in base_daily.groupby("station_id")
+    }
 
     min_lag_days_min = int(np.ceil(max(1, (min_causal_lag_hours + morning_min_gate_utc - issue_hour_utc) / 24.0)))
     min_lag_days_max = int(np.ceil(max(1, (min_causal_lag_hours + afternoon_max_gate_utc - issue_hour_utc) / 24.0)))
@@ -225,7 +236,14 @@ def build_aligned_tensors(
     if issue_hour_utc < afternoon_max_gate_utc:
         min_lag_days_max = max(min_lag_days_max, 1)
 
-    all_dates = sorted(coop_df["obs_date"].unique())
+    hrrr_col_indices = [i for i, name in enumerate(all_dyn_names) if name.startswith("hrrr_")]
+    prim_min_col = dyn_cols.index(f"{primary_src}_t2m_min_win")
+    prim_max_col = dyn_cols.index(f"{primary_src}_t2m_max_win")
+    prim_snow_col = dyn_cols.index(f"{primary_src}_snow_min_win") if f"{primary_src}_snow_min_win" in dyn_cols else -1
+    hrrr_min_col = dyn_cols.index("hrrr_t2m_min_win") if "hrrr_t2m_min_win" in dyn_cols else -1
+    hrrr_max_col = dyn_cols.index("hrrr_t2m_max_win") if "hrrr_t2m_max_win" in dyn_cols else -1
+
+    LAPSE_F_PER_M = 0.01168
 
     issue_dates_out = []
     sids_out = []
@@ -237,14 +255,11 @@ def build_aligned_tensors(
     y_list = []
     snow_list = []
 
-    hrrr_col_indices = [i for i, name in enumerate(all_dyn_names) if name.startswith("hrrr_")]
+    active_sids = [sid for sid in st_meta.index if sid in coop_by_sid and sid in dyn_by_sid]
+    total_st = len(active_sids)
 
-    # Standard environmental lapse adjustment: ~3.56 F per 1000 ft = 0.01168 F / m
-    LAPSE_F_PER_M = 0.01168
-
-    for sid in st_meta.index:
-        if sid not in coop_by_sid:
-            continue
+    for st_i, sid in enumerate(active_sids, start=1):
+        st_t0 = time.monotonic()
         st_row = st_meta.loc[sid]
         elev_m = float(st_row["elev_m"])
         lat = float(st_row["lat"])
@@ -253,73 +268,83 @@ def build_aligned_tensors(
         tier_oh = tier_codes.get(tier_str, [1.0, 0.0, 0.0])
 
         st_coop = coop_by_sid[sid]
-        coop_dates = st_coop["obs_date"].values
+        st_dyn = dyn_by_sid[sid]
 
-        # Representative grid elevation for terrain offset
-        st_dyn_sub = base_daily[base_daily["station_id"] == sid]
-        if st_dyn_sub.empty:
-            continue
-        primary_grid_elev = float(st_dyn_sub[f"{primary_src}_grid_elev_m"].dropna().iloc[0]) if f"{primary_src}_grid_elev_m" in st_dyn_sub.columns and st_dyn_sub[f"{primary_src}_grid_elev_m"].notna().any() else elev_m
+        coop_dates = st_coop["obs_date"].values.astype("datetime64[D]")
+        coop_tmin = st_coop["tmin_f"].to_numpy(dtype=np.float32)
+        coop_tmax = st_coop["tmax_f"].to_numpy(dtype=np.float32)
+        coop_snowd = st_coop["snowd"].to_numpy(dtype=np.float32) if "snowd" in st_coop.columns else np.zeros(len(st_coop), dtype=np.float32)
+
+        dyn_dates = st_dyn["target_date"].values.astype("datetime64[D]")
+        dyn_mat = st_dyn[dyn_cols].to_numpy(dtype=np.float32)
+
+        prim_ge_col = f"{primary_src}_grid_elev_m"
+        primary_grid_elev = (
+            float(st_dyn[prim_ge_col].dropna().iloc[0])
+            if prim_ge_col in st_dyn.columns and st_dyn[prim_ge_col].notna().any()
+            else elev_m
+        )
+        hrrr_grid_elev = (
+            float(st_dyn["hrrr_grid_elev_m"].dropna().iloc[0])
+            if "hrrr_grid_elev_m" in st_dyn.columns and st_dyn["hrrr_grid_elev_m"].notna().any()
+            else primary_grid_elev
+        )
         elev_delta_m = elev_m - primary_grid_elev
 
-        for issue_dt in all_dates:
-            issue_ts = pd.Timestamp(issue_dt)
-            horizon_dates = [issue_ts + pd.Timedelta(days=d) for d in range(5)]
+        coop_map = {d: idx for idx, d in enumerate(coop_dates)}
+        dyn_map = {d: idx for idx, d in enumerate(dyn_dates)}
 
-            # Require complete 5-day COOP targets and base dynamic rows
-            valid_sample = True
+        st_samples = 0
+        for issue_d64 in coop_dates:
+            horizon_d64 = [issue_d64 + np.timedelta64(d, "D") for d in range(5)]
+            if not all((hd in coop_map and hd in dyn_map) for hd in horizon_d64):
+                continue
+
+            cutoff_min_d64 = issue_d64 - np.timedelta64(min_lag_days_min, "D")
+            cutoff_max_d64 = issue_d64 - np.timedelta64(min_lag_days_max, "D")
+            idx_min = int(np.searchsorted(coop_dates, cutoff_min_d64, side="right")) - 1
+            idx_max = int(np.searchsorted(coop_dates, cutoff_max_d64, side="right")) - 1
+
+            c_vals = np.full(len(causal_cols), np.nan, dtype=np.float32)
+            if idx_min >= 2:
+                c_vals[0] = coop_tmin[idx_min]
+                c_vals[1] = coop_tmin[idx_min - 1]
+                c_vals[2] = float(coop_tmin[max(0, idx_min - 6) : idx_min + 1].mean())
+                c_vals[6] = coop_snowd[idx_min]
+            if idx_max >= 2:
+                c_vals[3] = coop_tmax[idx_max]
+                c_vals[4] = coop_tmax[idx_max - 1]
+                c_vals[5] = float(coop_tmax[max(0, idx_max - 6) : idx_max + 1].mean())
+
             y_sample = np.zeros((5, 2), dtype=np.float32)
             dyn_sample = np.full((5, len(all_dyn_names)), np.nan, dtype=np.float32)
             anchor_sample = np.zeros((5, 2), dtype=np.float32)
             snow_sample = np.zeros(5, dtype=bool)
+            valid_sample = True
 
-            # Strictly causal lag lookup
-            cutoff_min_dt = (issue_ts - pd.Timedelta(days=min_lag_days_min)).to_datetime64()
-            cutoff_max_dt = (issue_ts - pd.Timedelta(days=min_lag_days_max)).to_datetime64()
+            for d_idx, hd in enumerate(horizon_d64):
+                ci = coop_map[hd]
+                di = dyn_map[hd]
+                row_vals = dyn_mat[di]
 
-            idx_min = np.searchsorted(coop_dates, cutoff_min_dt, side="right") - 1
-            idx_max = np.searchsorted(coop_dates, cutoff_max_dt, side="right") - 1
+                y_sample[d_idx, 0] = coop_tmin[ci]
+                y_sample[d_idx, 1] = coop_tmax[ci]
 
-            c_vals = np.full(len(causal_cols), np.nan, dtype=np.float32)
-            if idx_min >= 2:
-                c_vals[0] = float(st_coop["tmin_f"].iloc[idx_min])
-                c_vals[1] = float(st_coop["tmin_f"].iloc[idx_min - 1])
-                c_vals[2] = float(st_coop["tmin_f"].iloc[max(0, idx_min - 6): idx_min + 1].mean())
-                c_vals[6] = float(st_coop["snowd"].iloc[idx_min])
-            if idx_max >= 2:
-                c_vals[3] = float(st_coop["tmax_f"].iloc[idx_max])
-                c_vals[4] = float(st_coop["tmax_f"].iloc[idx_max - 1])
-                c_vals[5] = float(st_coop["tmax_f"].iloc[max(0, idx_max - 6): idx_max + 1].mean())
-
-            for d_idx, h_dt in enumerate(horizon_dates):
-                if (sid, h_dt) not in coop_indexed.index or (sid, h_dt) not in dyn_indexed.index:
-                    valid_sample = False
-                    break
-                obs_r = coop_indexed.loc[(sid, h_dt)]
-                dyn_r = dyn_indexed.loc[(sid, h_dt)]
-
-                y_sample[d_idx, 0] = float(obs_r["tmin_f"])
-                y_sample[d_idx, 1] = float(obs_r["tmax_f"])
-
-                row_vals = dyn_r[dyn_cols].to_numpy(dtype=np.float32)
                 dyn_sample[d_idx, : len(dyn_cols)] = row_vals
                 dyn_sample[d_idx, len(dyn_cols) :] = c_vals
 
-                # Enforce HRRR 48h horizon cutoff: Days 3, 4, 5 (d_idx >= 2) are masked out
                 if d_idx >= 2 and hrrr_col_indices:
                     dyn_sample[d_idx, hrrr_col_indices] = np.nan
 
-                # Raw lapse-adjusted anchor temperature (prefer HRRR on Days 1-2 if valid, else primary)
                 raw_min = np.nan
                 raw_max = np.nan
-                if d_idx < 2 and f"hrrr_t2m_min_win" in dyn_r.index and pd.notna(dyn_r["hrrr_t2m_min_win"]):
-                    hrrr_ge = float(dyn_r["hrrr_grid_elev_m"]) if pd.notna(dyn_r.get("hrrr_grid_elev_m", np.nan)) else primary_grid_elev
-                    raw_min = float(dyn_r["hrrr_t2m_min_win"]) - LAPSE_F_PER_M * (elev_m - hrrr_ge)
-                    raw_max = float(dyn_r["hrrr_t2m_max_win"]) - LAPSE_F_PER_M * (elev_m - hrrr_ge)
+                if d_idx < 2 and hrrr_min_col >= 0 and not np.isnan(row_vals[hrrr_min_col]):
+                    raw_min = float(row_vals[hrrr_min_col]) - LAPSE_F_PER_M * (elev_m - hrrr_grid_elev)
+                    raw_max = float(row_vals[hrrr_max_col]) - LAPSE_F_PER_M * (elev_m - hrrr_grid_elev)
 
                 if np.isnan(raw_min):
-                    raw_min = float(dyn_r[f"{primary_src}_t2m_min_win"]) - LAPSE_F_PER_M * elev_delta_m
-                    raw_max = float(dyn_r[f"{primary_src}_t2m_max_win"]) - LAPSE_F_PER_M * elev_delta_m
+                    raw_min = float(row_vals[prim_min_col]) - LAPSE_F_PER_M * elev_delta_m
+                    raw_max = float(row_vals[prim_max_col]) - LAPSE_F_PER_M * elev_delta_m
 
                 if np.isnan(raw_min) or np.isnan(raw_max):
                     valid_sample = False
@@ -328,10 +353,8 @@ def build_aligned_tensors(
                 anchor_sample[d_idx, 0] = raw_min
                 anchor_sample[d_idx, 1] = raw_max
 
-                snow_col = f"{primary_src}_snow_min_win"
-                obs_snow = float(obs_r["snowd"]) if "snowd" in obs_r.index else 0.0
-                mod_snow = float(dyn_r[snow_col]) if snow_col in dyn_r.index and pd.notna(dyn_r[snow_col]) else 0.0
-                snow_sample[d_idx] = (obs_snow > 0.1) or (mod_snow > 0.01)
+                mod_snow = float(row_vals[prim_snow_col]) if prim_snow_col >= 0 and not np.isnan(row_vals[prim_snow_col]) else 0.0
+                snow_sample[d_idx] = (coop_snowd[ci] > 0.1) or (mod_snow > 0.01)
 
             if not valid_sample:
                 continue
@@ -339,7 +362,7 @@ def build_aligned_tensors(
             mask_sample = (~np.isnan(dyn_sample)).astype(np.float32)
             dyn_clean = np.nan_to_num(dyn_sample, nan=0.0)
 
-            doy = issue_ts.dayofyear
+            doy = pd.Timestamp(issue_d64).dayofyear
             sin_doy = float(np.sin(2.0 * np.pi * doy / 365.25))
             cos_doy = float(np.cos(2.0 * np.pi * doy / 365.25))
 
@@ -356,7 +379,7 @@ def build_aligned_tensors(
                 dtype=np.float32,
             )
 
-            issue_dates_out.append(np.datetime64(issue_ts.strftime("%Y-%m-%d")))
+            issue_dates_out.append(issue_d64)
             sids_out.append(sid)
             tiers_out.append(tier_str)
             x_dyn_list.append(dyn_clean)
@@ -365,6 +388,13 @@ def build_aligned_tensors(
             anchor_list.append(anchor_sample)
             y_list.append(y_sample)
             snow_list.append(snow_sample)
+            st_samples += 1
+
+        print(
+            f"  [{_ts()}] [tensors {st_i:02d}/{total_st:02d}] {sid} ({st_row['name']}): "
+            f"{st_samples:,} 5-day sequences aligned in {time.monotonic() - st_t0:.2f}s",
+            flush=True,
+        )
 
     ctx_names = [
         "elev_km",
@@ -379,6 +409,10 @@ def build_aligned_tensors(
     ]
 
     order = np.argsort(np.array(issue_dates_out))
+    print(
+        f"  [{_ts()}] [tensors] Total aligned dataset ready in {time.monotonic() - t_start:.1f}s",
+        flush=True,
+    )
     return TensorBundle(
         issue_dates=np.array(issue_dates_out)[order],
         station_ids=np.array(sids_out)[order],
