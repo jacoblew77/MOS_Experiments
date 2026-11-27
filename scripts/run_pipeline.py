@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -22,11 +24,14 @@ from fgz_nn_lab.models import (
 from fgz_nn_lab.splits import FoldScaler, make_purged_expanding_splits
 
 
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+
+
 def apply_ablation_channel_mask(
     bundle: TensorBundle,
     active_groups: set[str],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Zeros out excluded predictor groups in mask_dyn and x_dyn for controlled ablations."""
     x_out = bundle.x_dyn.copy()
     m_out = bundle.mask_dyn.copy()
 
@@ -64,7 +69,6 @@ def evaluate_model_across_folds(
     cfg: dict,
     mode: str,
 ) -> tuple[dict[str, float], dict[str, float], object]:
-    """Runs fold-by-fold training, averages test predictions across fold ensemble, returns metrics."""
     val_preds_all = []
     val_true_all = []
     val_sids_all = []
@@ -74,8 +78,16 @@ def evaluate_model_across_folds(
     test_idx = folds[-1].test_idx
     test_preds_ensemble = np.zeros((len(test_idx), 5, 2), dtype=np.float32)
 
-    for fold in folds:
+    for f_i, fold in enumerate(folds, start=1):
+        f_label = f"{fold.fold_name} ({f_i}/{len(folds)})"
         tr, va, te = fold.train_idx, fold.val_idx, fold.test_idx
+        print(
+            f"    [{_ts()}] [{mode.upper()}] Starting {f_label} "
+            f"(train={len(tr):,}, val={len(va):,}, test={len(te):,})...",
+            flush=True,
+        )
+        t_fold = time.monotonic()
+
         scaler = FoldScaler().fit(
             x_dyn[tr],
             mask_dyn[tr],
@@ -105,17 +117,12 @@ def evaluate_model_across_folds(
                 xd_te, mask_dyn[te], xc_te, anc_te,
             )
         elif mode == "lgbm":
-            vp = fit_predict_lgbm_baseline(
-                xd_tr, mask_dyn[tr], xc_tr, anc_tr, bundle.y_true[tr],
-                xd_va, mask_dyn[va], xc_va, anc_va, bundle.y_true[va],
-                xd_va, mask_dyn[va], xc_va, anc_va,
-                seed=int(cfg["seed"]),
-            )
-            tp = fit_predict_lgbm_baseline(
+            vp, tp = fit_predict_lgbm_baseline(
                 xd_tr, mask_dyn[tr], xc_tr, anc_tr, bundle.y_true[tr],
                 xd_va, mask_dyn[va], xc_va, anc_va, bundle.y_true[va],
                 xd_te, mask_dyn[te], xc_te, anc_te,
                 seed=int(cfg["seed"]),
+                fold_label=fold.fold_name,
             )
         elif mode == "nn":
             vp, tp, _ = train_and_predict_nn(
@@ -124,9 +131,17 @@ def evaluate_model_across_folds(
                 xd_te, mask_dyn[te], xc_te, anc_te,
                 nn_cfg=cfg["nn"],
                 seed=int(cfg["seed"]),
+                fold_label=fold.fold_name,
             )
         else:
             raise ValueError(f"Unknown mode: {mode}")
+
+        fold_val_mae = float(np.abs(vp - bundle.y_true[va]).mean())
+        print(
+            f"    [{_ts()}] [{mode.upper()}] Finished {f_label} in {time.monotonic() - t_fold:.1f}s "
+            f"| Fold Val Combined MAE: {fold_val_mae:.3f}F",
+            flush=True,
+        )
 
         val_preds_all.append(vp)
         val_true_all.append(bundle.y_true[va])
@@ -153,6 +168,7 @@ def evaluate_model_across_folds(
 
 
 def main() -> None:
+    run_t0 = time.monotonic()
     parser = argparse.ArgumentParser(description="FGZ COOP 5-Day Extremum NN Pipeline")
     parser.add_argument(
         "--stage",
@@ -163,12 +179,10 @@ def main() -> None:
         "--source-mode",
         choices=["era5", "nwp_hybrid"],
         default="era5",
-        help="era5 uses multi-year ERA5 archive; nwp_hybrid adds archived HRRR + GFS + ECMWF IFS",
     )
     parser.add_argument(
         "--fast-smoke",
         action="store_true",
-        help="Use compact 2-year smoke window and 3 stations for rapid verification",
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--stations", type=Path, default=Path("configs/stations_fgz_coop.json"))
@@ -194,7 +208,11 @@ def main() -> None:
     raw_dir = Path("data/raw")
     runs_dir = Path("data/runs")
 
-    print(f"[1/4] Ingesting FGZ COOP observations & {args.source_mode} predictors ({start_date} -> {end_date})...")
+    print(
+        f"\n[{_ts()}] >>> [STAGE 1/4: INGEST] mode={args.source_mode}, stage={args.stage}, "
+        f"window={start_date}..{end_date}, stations={len(stations_df)} <<<",
+        flush=True,
+    )
     coop_df = fetch_iem_coop_observations(stations_df, start_date, end_date, raw_dir, min_clean_days=min_days)
     stations_active = stations_df[stations_df["station_id"].isin(coop_df["station_id"].unique())].reset_index(drop=True)
     hourly_by_src = fetch_hourly_predictors_for_stations(
@@ -202,10 +220,17 @@ def main() -> None:
     )
 
     if args.stage == "ingest":
-        print(f"Ingest complete. Active QC stations: {len(stations_active)}, COOP rows: {len(coop_df)}")
+        print(
+            f"\n[{_ts()}] >>> INGEST COMPLETE in {time.monotonic() - run_t0:.1f}s | "
+            f"Active QC stations: {len(stations_active)}, COOP rows: {len(coop_df):,} <<<",
+            flush=True,
+        )
         return
 
-    print("[2/4] Aligning sub-daily Min/Max windows, causal lags, and 5-day target tensors...")
+    print(
+        f"\n[{_ts()}] >>> [STAGE 2/4: ALIGNMENT] Building sub-daily windows, causal lags, and 5-day tensors <<<",
+        flush=True,
+    )
     qg = cfg["qc_and_gating"]
     bundle = build_aligned_tensors(
         stations_df=stations_active,
@@ -216,8 +241,11 @@ def main() -> None:
         afternoon_max_gate_utc=int(qg["afternoon_max_gate_utc"]),
         min_causal_lag_hours=int(qg["min_causal_lag_hours"]),
     )
-    print(f"Built {len(bundle.issue_dates)} 5-day samples across {len(np.unique(bundle.station_ids))} stations "
-          f"with {len(bundle.dyn_feature_names)} dynamic channels.")
+    print(
+        f"  [{_ts()}] Summary: {len(bundle.issue_dates):,} 5-day sequences | "
+        f"{len(np.unique(bundle.station_ids))} stations | {len(bundle.dyn_feature_names)} dynamic channels",
+        flush=True,
+    )
 
     sp = cfg["splits"]
     folds = make_purged_expanding_splits(
@@ -227,9 +255,18 @@ def main() -> None:
         val_fold_days=120 if args.fast_smoke else int(sp["val_fold_days"]),
         purge_days=int(sp["purge_days"]),
     )
+    for f in folds:
+        tr_s, tr_e = bundle.issue_dates[f.train_idx[0]], bundle.issue_dates[f.train_idx[-1]]
+        va_s, va_e = bundle.issue_dates[f.val_idx[0]], bundle.issue_dates[f.val_idx[-1]]
+        te_s, te_e = bundle.issue_dates[f.test_idx[0]], bundle.issue_dates[f.test_idx[-1]]
+        print(
+            f"  [{_ts()}] Split {f.fold_name}: Train[{tr_s}..{tr_e}] | "
+            f"Val[{va_s}..{va_e}] | Test[{te_s}..{te_e}]",
+            flush=True,
+        )
 
     if args.stage in ("baselines", "all"):
-        print("[3/4] Running Baseline Ladder (Calibrated Anchor, Ridge MOS, LightGBM L1 GBDT)...")
+        print(f"\n[{_ts()}] >>> [STAGE 3/4: BASELINES] Running Anchor, Ridge MOS, and LightGBM <<<", flush=True)
         for b_mode in ("anchor", "ridge", "lgbm"):
             v_sum, t_sum, t_strat = evaluate_model_across_folds(
                 bundle, bundle.x_dyn, bundle.mask_dyn, folds, cfg, mode=b_mode
@@ -244,11 +281,16 @@ def main() -> None:
                 stratified_df=t_strat,
                 config_snapshot=cfg,
             )
-            print(f"  {b_mode.upper():8s} | Test Min MAE (D1-5): {t_sum['mae_min_1_5']:.3f} F | "
-                  f"Test Max MAE (D1-5): {t_sum['mae_max_1_5']:.3f} F | Combined: {t_sum['mae_all_1_5']:.3f} F")
+            print(
+                f"  [{_ts()}] RESULT {b_mode.upper():8s} | "
+                f"Test Min MAE (D1-5): {t_sum['mae_min_1_5']:.3f}F | "
+                f"Test Max MAE (D1-5): {t_sum['mae_max_1_5']:.3f}F | "
+                f"Combined: {t_sum['mae_all_1_5']:.3f}F",
+                flush=True,
+            )
 
     if args.stage in ("train-nn", "all"):
-        print("[4/4] Training FiLM-Conditioned 5-Day Multi-Horizon Residual Neural Network...")
+        print(f"\n[{_ts()}] >>> [STAGE 4/4: NEURAL NET] Training FiLM Multi-Horizon ResNet <<<", flush=True)
         v_sum, t_sum, t_strat = evaluate_model_across_folds(
             bundle, bundle.x_dyn, bundle.mask_dyn, folds, cfg, mode="nn"
         )
@@ -262,11 +304,16 @@ def main() -> None:
             stratified_df=t_strat,
             config_snapshot=cfg,
         )
-        print(f"  NN_FULL  | Test Min MAE (D1-5): {t_sum['mae_min_1_5']:.3f} F | "
-              f"Test Max MAE (D1-5): {t_sum['mae_max_1_5']:.3f} F | Combined: {t_sum['mae_all_1_5']:.3f} F")
+        print(
+            f"  [{_ts()}] RESULT NN_FULL  | "
+            f"Test Min MAE (D1-5): {t_sum['mae_min_1_5']:.3f}F | "
+            f"Test Max MAE (D1-5): {t_sum['mae_max_1_5']:.3f}F | "
+            f"Combined: {t_sum['mae_all_1_5']:.3f}F",
+            flush=True,
+        )
 
     if args.stage == "ablations":
-        print("[Ablations] Running stepwise physical predictor ablations on NN...")
+        print(f"\n[{_ts()}] >>> [ABLATIONS] Running 6-step physical predictor ladder <<<", flush=True)
         ladder = [
             ("step_a_site_season_only", set()),
             ("step_b_add_core_synoptic", {"core_synoptic"}),
@@ -275,7 +322,8 @@ def main() -> None:
             ("step_e_add_snow_soil", {"core_synoptic", "pbl_rad_wind", "hrrr_meso", "snow_soil"}),
             ("step_f_add_spread_and_lags", {"core_synoptic", "pbl_rad_wind", "hrrr_meso", "snow_soil", "ens_spread", "causal_lags"}),
         ]
-        for step_tag, groups in ladder:
+        for s_idx, (step_tag, groups) in enumerate(ladder, start=1):
+            print(f"\n  [{_ts()}] --- Ablation [{s_idx}/{len(ladder)}]: {step_tag} ---", flush=True)
             x_abl, m_abl = apply_ablation_channel_mask(bundle, groups)
             v_sum, t_sum, t_strat = evaluate_model_across_folds(
                 bundle, x_abl, m_abl, folds, cfg, mode="nn"
@@ -290,9 +338,18 @@ def main() -> None:
                 stratified_df=t_strat,
                 config_snapshot=cfg,
             )
-            print(f"  {step_tag:28s} | Min MAE: {t_sum['mae_min_1_5']:.3f} F | Max MAE: {t_sum['mae_max_1_5']:.3f} F")
+            print(
+                f"  [{_ts()}] ABLATION {step_tag:28s} | "
+                f"Test Min MAE: {t_sum['mae_min_1_5']:.3f}F | "
+                f"Test Max MAE: {t_sum['mae_max_1_5']:.3f}F",
+                flush=True,
+            )
 
-    print(f"\nLeaderboard updated at: {runs_dir / 'leaderboard.csv'}")
+    print(
+        f"\n[{_ts()}] >>> ALL DONE in {time.monotonic() - run_t0:.1f}s | "
+        f"Leaderboard: {runs_dir / 'leaderboard.csv'} <<<",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
