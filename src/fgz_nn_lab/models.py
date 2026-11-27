@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import lightgbm as lgb
@@ -10,6 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.linear_model import Ridge
 from torch.utils.data import DataLoader, TensorDataset
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
 def fit_predict_ridge_baseline(
@@ -23,7 +29,6 @@ def fit_predict_ridge_baseline(
     x_ctx_ev: np.ndarray,
     anchor_ev: np.ndarray,
 ) -> np.ndarray:
-    """Per-horizon Ridge MOS predicting residual corrections around the calibrated anchor."""
     preds = np.zeros_like(anchor_ev, dtype=np.float32)
     for d in range(5):
         f_tr = np.concatenate([x_dyn_tr[:, d, :], mask_tr[:, d, :], x_ctx_tr], axis=1)
@@ -52,9 +57,13 @@ def fit_predict_lgbm_baseline(
     x_ctx_ev: np.ndarray,
     anchor_ev: np.ndarray,
     seed: int = 42,
-) -> np.ndarray:
-    """Strong L1-loss GBDT benchmark trained per lead day and extremum."""
-    preds = np.zeros_like(anchor_ev, dtype=np.float32)
+    fold_label: str = "",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fits L1-loss GBDT once per lead day & extremum, returning BOTH (val_preds, eval_preds)."""
+    val_preds = np.zeros_like(anchor_va, dtype=np.float32)
+    ev_preds = np.zeros_like(anchor_ev, dtype=np.float32)
+    t0 = time.monotonic()
+
     for d in range(5):
         f_tr = np.concatenate([x_dyn_tr[:, d, :], mask_tr[:, d, :], x_ctx_tr, anchor_tr[:, d, :]], axis=1)
         f_va = np.concatenate([x_dyn_va[:, d, :], mask_va[:, d, :], x_ctx_va, anchor_va[:, d, :]], axis=1)
@@ -81,13 +90,17 @@ def fit_predict_lgbm_baseline(
                 eval_set=[(f_va, res_va)],
                 callbacks=[lgb.early_stopping(35, verbose=False)],
             )
-            preds[:, d, target_i] = anchor_ev[:, d, target_i] + gbm.predict(f_ev).astype(np.float32)
-    return preds
+            val_preds[:, d, target_i] = anchor_va[:, d, target_i] + gbm.predict(f_va).astype(np.float32)
+            ev_preds[:, d, target_i] = anchor_ev[:, d, target_i] + gbm.predict(f_ev).astype(np.float32)
+
+        print(
+            f"      [{_ts()}] [LGBM {fold_label}] Day {d + 1}/5 Min+Max trees fitted ({time.monotonic() - t0:.1f}s elapsed)",
+            flush=True,
+        )
+    return val_preds, ev_preds
 
 
 class ResidualTemporalBlock(nn.Module):
-    """1D Convolutional residual block across the 5-day forecast horizon."""
-
     def __init__(self, hidden_dim: int, dropout: float) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
@@ -97,7 +110,6 @@ class ResidualTemporalBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 5, H)
         h = self.norm1(x)
         h = F.silu(self.conv1(h.transpose(1, 2)).transpose(1, 2))
         h = self.drop(h)
@@ -107,13 +119,6 @@ class ResidualTemporalBlock(nn.Module):
 
 
 class FGZMultiHorizonResNet(nn.Module):
-    """
-    FiLM-Conditioned Multi-Horizon Sequence Network with Split Min T & Max T Residual Heads.
-      - Site/Terrain/Seasonal encoder produces FiLM (gamma, beta) modulation per station & DOY
-      - Horizon embedding + 1D Conv + BiGRU captures adjacent-day frontal/snow transitions
-      - Separate Min T and Max T heads predict residuals around calibrated physical anchors
-    """
-
     def __init__(
         self,
         dyn_dim: int,
@@ -125,7 +130,7 @@ class FGZMultiHorizonResNet(nn.Module):
     ) -> None:
         super().__init__()
         self.channel_dropout = channel_dropout
-        in_per_day = dyn_dim * 2 + 2  # dynamic features + availability masks + [anchor_min, anchor_max]
+        in_per_day = dyn_dim * 2 + 2
 
         self.ctx_encoder = nn.Sequential(
             nn.Linear(ctx_dim, ctx_embed_dim),
@@ -184,15 +189,14 @@ class FGZMultiHorizonResNet(nn.Module):
             x_dyn = x_dyn * chan_mask
             mask_dyn = mask_dyn * chan_mask
 
-        # Normalize anchor scale mildly for input feature stability while adding raw anchor at output
         anchor_scaled = (anchor - 50.0) / 25.0
-        day_in = torch.cat([x_dyn, mask_dyn, anchor_scaled], dim=-1)  # (B, 5, 2*C_dyn + 2)
+        day_in = torch.cat([x_dyn, mask_dyn, anchor_scaled], dim=-1)
 
         h = self.in_proj(day_in)
         day_ids = torch.arange(5, device=x_dyn.device).unsqueeze(0)
         h = h + self.day_embed(day_ids)
 
-        ctx_emb = self.ctx_encoder(x_ctx)  # (B, E)
+        ctx_emb = self.ctx_encoder(x_ctx)
         gamma = 1.0 + 0.25 * torch.tanh(self.film_gamma(ctx_emb)).unsqueeze(1)
         beta = self.film_beta(ctx_emb).unsqueeze(1)
         h = gamma * h + beta
@@ -205,8 +209,8 @@ class FGZMultiHorizonResNet(nn.Module):
         ctx_rep = ctx_emb.unsqueeze(1).expand(-1, 5, -1)
         joint = self.post_norm(torch.cat([h, ctx_rep], dim=-1))
 
-        delta_min = self.min_head(joint).squeeze(-1)  # (B, 5)
-        delta_max = self.max_head(joint).squeeze(-1)  # (B, 5)
+        delta_min = self.min_head(joint).squeeze(-1)
+        delta_max = self.max_head(joint).squeeze(-1)
         deltas = torch.stack([delta_min, delta_max], dim=-1)
         return anchor + deltas
 
@@ -230,8 +234,6 @@ def compute_extremum_loss(
 
     weighted = horizon_weights.unsqueeze(0) * (min_weight * err_min + max_weight * err_max)
     base_loss = weighted.mean()
-
-    # Soft physical ordering penalty: Min T must not exceed Max T
     crossing = F.relu(pred[:, :, 0] - pred[:, :, 1] + 0.5).mean()
     return base_loss + crossing_weight * crossing
 
@@ -253,10 +255,12 @@ def train_and_predict_nn(
     anchor_ev: np.ndarray,
     nn_cfg: dict[str, Any],
     seed: int = 42,
+    fold_label: str = "",
 ) -> tuple[np.ndarray, np.ndarray, FGZMultiHorizonResNet]:
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t0 = time.monotonic()
 
     model = FGZMultiHorizonResNet(
         dyn_dim=x_dyn_tr.shape[2],
@@ -306,6 +310,7 @@ def train_and_predict_nn(
     y_va_t = torch.from_numpy(y_va).to(device)
 
     best_val_mae = float("inf")
+    best_epoch = 0
     best_state = copy.deepcopy(model.state_dict())
     stale_epochs = 0
 
@@ -340,16 +345,36 @@ def train_and_predict_nn(
         model.eval()
         with torch.no_grad():
             va_pred = model(*t_va)
-            val_mae = float(torch.abs(va_pred - y_va_t).mean().item())
+            abs_diff = torch.abs(va_pred - y_va_t)
+            val_mae = float(abs_diff.mean().item())
+            val_min_mae = float(abs_diff[:, :, 0].mean().item())
+            val_max_mae = float(abs_diff[:, :, 1].mean().item())
 
-        if val_mae < best_val_mae - 1e-4:
+        improved = val_mae < best_val_mae - 1e-4
+        if improved:
             best_val_mae = val_mae
+            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             stale_epochs = 0
         else:
             stale_epochs += 1
-            if stale_epochs >= patience:
-                break
+
+        if epoch == 1 or epoch % 5 == 0 or stale_epochs >= patience or epoch == max_epochs:
+            tag = "*best*" if improved else f"stale {stale_epochs}/{patience}"
+            print(
+                f"      [{_ts()}] [NN {fold_label}] Ep {epoch:02d}/{max_epochs:02d} | "
+                f"Val Min: {val_min_mae:.3f}F | Val Max: {val_max_mae:.3f}F | "
+                f"Combined: {val_mae:.3f}F ({tag}, {time.monotonic() - t0:.1f}s)",
+                flush=True,
+            )
+
+        if stale_epochs >= patience:
+            print(
+                f"      [{_ts()}] [NN {fold_label}] Early stopping triggered at epoch {epoch} "
+                f"(best epoch {best_epoch}: {best_val_mae:.3f}F)",
+                flush=True,
+            )
+            break
 
     model.load_state_dict(best_state)
     model.eval()
