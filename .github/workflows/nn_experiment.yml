@@ -59,7 +59,16 @@ jobs:
       - name: Run zero-estimated QC, network-stack, and dashboard unit tests
         run: pytest -v
 
-      - name: Restore cached Parquet archives & trained model checkpoints
+      - name: Restore legacy v4 20-station Parquet cache (path=data/raw)
+        if: github.event_name != 'push'
+        uses: actions/cache/restore@v4
+        with:
+          path: data/raw
+          key: fgz-op-v4-legacy-bridge
+          restore-keys: |
+            fgz-op-v4-
+
+      - name: Restore v5 26-station Parquet & trained checkpoint cache
         if: github.event_name != 'push'
         uses: actions/cache/restore@v4
         with:
@@ -70,7 +79,6 @@ jobs:
           restore-keys: |
             fgz-op-v5-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-
             fgz-op-v5-
-            fgz-op-v4-
 
       - name: Snapshot cache file count
         id: pre-count

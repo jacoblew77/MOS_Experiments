@@ -78,7 +78,7 @@ LIVE_FORECAST_VARS = [
 
 
 class OpenMeteoDailyQuotaError(RuntimeError):
-    """Raised when a runner IP hits Open-Meteo's 24h UTC limit (Retry-After > 1200s)."""
+    """Raised ONLY when a runner IP hits Open-Meteo's multi-hour 24h UTC cap (Retry-After > 3900s)."""
 
 
 def _ts() -> str:
@@ -501,7 +501,6 @@ def _parse_mos_csv_text(csv_text: str, m_id: str) -> pd.DataFrame:
     df["target_date"] = (df["ftime_utc"] - pd.Timedelta(hours=7)).dt.floor("D")
     df["tmp_num"] = pd.to_numeric(df.get("tmp", np.nan), errors="coerce")
     df["nx_num"] = pd.to_numeric(df.get("n_x", np.nan), errors="coerce")
-    # MEX uses 'x_n' or 'n_x' depending on bulletin format
     if "x_n" in df.columns:
         df["nx_num"] = df["nx_num"].combine_first(pd.to_numeric(df["x_n"], errors="coerce"))
     df["dpt_num"] = pd.to_numeric(df.get("dpt", np.nan), errors="coerce")
@@ -527,10 +526,6 @@ def fetch_iem_mos_bulletins(
     end_date: str,
     raw_dir: Path,
 ) -> pd.DataFrame:
-    """
-    Fetches BOTH 12Z Short-Range GFS MOS ('GFS', Days 1-3) AND 12Z GFS Extended MOS ('MEX', Days 4-5)
-    from IEM so mos_bulletin_* channels have full 5-day (24h..120h) coverage!
-    """
     raw_dir.mkdir(parents=True, exist_ok=True)
     mos_ids = sorted(stations_df["mos_id"].dropna().unique().tolist())
     mos_cache = raw_dir / f"iem_gfs_mex_mos_v4_{start_date}_{end_date}_{_det_sig(mos_ids)}.parquet"
@@ -569,7 +564,6 @@ def fetch_iem_mos_bulletins(
                 time.sleep(1.2)
 
         if st_parts:
-            # Prefer high-res 3h GFS MAV on Days 1-3, fill Days 4-5 seamlessly with 12Z MEX!
             merged_m = (
                 pd.concat(st_parts, ignore_index=True)
                 .sort_values(["issue_date", "target_date", "_priority"])
@@ -596,6 +590,10 @@ def _request_open_meteo_json(
     retries: int = 12,
     read_timeout: int = 150,
 ) -> Any:
+    """
+    Distinguishes 1-minute / 1-hour rolling windows (Retry-After <= 3900s, which sleep cleanly)
+    from multi-hour 24h UTC caps (Retry-After > 3900s, which trigger graceful partial fallback).
+    """
     delay = 10.0
     for attempt in range(retries):
         try:
@@ -604,14 +602,14 @@ def _request_open_meteo_json(
                 return resp.json()
             if resp.status_code == 429:
                 hdr_wait = float(resp.headers.get("Retry-After", 0.0) or 0.0)
-                if hdr_wait > 1200.0:
+                if hdr_wait > 3900.0:
                     raise OpenMeteoDailyQuotaError(
                         f"Runner IP hit Open-Meteo 24h UTC cap (Retry-After={hdr_wait:.0f}s)"
                     )
                 if attempt < retries - 1:
-                    wait_s = max(min(hdr_wait, 900.0), min(delay, 120.0))
+                    wait_s = max(hdr_wait + 5.0, min(delay, 120.0)) if hdr_wait > 0 else min(delay, 120.0)
                     print(
-                        f"    [{_ts()}] [{src_label}] Open-Meteo 429 pause; waiting {wait_s:.0f}s "
+                        f"    [{_ts()}] [{src_label}] Open-Meteo rolling-window 429 pause; sleeping {wait_s:.0f}s "
                         f"(attempt {attempt + 1}/{retries})...",
                         flush=True,
                     )
@@ -647,62 +645,64 @@ def _build_date_windows(start_date: str, end_date: str, chunk_months: int) -> li
 
 def _salvage_cached_stations(
     raw_dir: Path,
-    chunk_dir: Path,
+    chunk_dir_v3: Path,
     src: str,
     eff_start: str,
     pad_end: str,
     target_sids: list[str],
     canonical_vars: list[str],
 ) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Reuses 100% of stations already downloaded in Iteration 3 (`hourly_v3_*` / `chunk_v3_*`)
-    or earlier Iteration 4 runs so Open-Meteo is ONLY queried for newly added delta stations!
-    """
     want = set(target_sids)
     covered: set[str] = set()
     frames: list[pd.DataFrame] = []
+    dt_s = pd.Timestamp(eff_start)
+    dt_e = pd.Timestamp(pad_end)
 
     candidates = sorted(
-        list(raw_dir.glob(f"hourly_v4_{src}_{eff_start}_{pad_end}_*.parquet"))
-        + list(raw_dir.glob(f"hourly_v3_{src}_{eff_start}_{pad_end}_*.parquet")),
+        list(raw_dir.glob(f"hourly_v4_{src}_*.parquet"))
+        + list(raw_dir.glob(f"hourly_v3_{src}_*.parquet")),
         key=lambda p: p.stat().st_mtime if p.exists() else 0,
         reverse=True,
     )
     for c_path in candidates:
         try:
             df = pd.read_parquet(c_path)
-            if "station_id" not in df.columns:
+            if "station_id" not in df.columns or "time_utc" not in df.columns:
                 continue
-            avail = set(df["station_id"].unique()).intersection(want - covered)
-            if avail:
-                sub = df[df["station_id"].isin(avail)].copy()
+            df_win = df[(df["time_utc"] >= dt_s) & (df["time_utc"] <= dt_e + pd.Timedelta(days=1))]
+            if df_win.empty:
+                continue
+            expected_hours = max(24, int((dt_e - dt_s).days * 18))
+            cnts = df_win.groupby("station_id")["time_utc"].count()
+            good = set(cnts[cnts >= expected_hours].index).intersection(want - covered)
+            if good:
+                sub = df_win[df_win["station_id"].isin(good)].copy()
                 for v in canonical_vars:
                     if v not in sub.columns:
                         sub[v] = np.float32(np.nan)
                 frames.append(sub)
-                covered.update(avail)
+                covered.update(good)
             if covered == want:
                 break
         except Exception:
             continue
 
-    # Also check partial chunk_v3_* caches (e.g., prev_ifs / prev_nbm) if full file wasn't written
-    if not covered and chunk_dir.exists():
-        ch_files = sorted(chunk_dir.glob(f"chunk_v3_{src}_*.parquet"))
+    if covered != want and chunk_dir_v3.exists():
+        ch_files = sorted(chunk_dir_v3.glob(f"chunk_v3_{src}_*.parquet"))
         if ch_files:
             ch_parts = []
             for cp in ch_files:
                 try:
                     cdf = pd.read_parquet(cp)
-                    ch_parts.append(cdf[cdf["station_id"].isin(want)])
+                    ch_parts.append(cdf[cdf["station_id"].isin(want - covered)])
                 except Exception:
                     continue
             if ch_parts:
                 comb_ch = pd.concat(ch_parts, ignore_index=True)
-                # Only treat a station as fully covered if it spans most of eff_start..pad_end
-                expected_hours = max(24, int((pd.Timestamp(pad_end) - pd.Timestamp(eff_start)).days * 20))
+                comb_ch = comb_ch[(comb_ch["time_utc"] >= dt_s) & (comb_ch["time_utc"] <= dt_e + pd.Timedelta(days=1))]
+                expected_hours = max(24, int((dt_e - dt_s).days * 16))
                 cnts = comb_ch.groupby("station_id")["time_utc"].count()
-                good_sids = set(cnts[cnts >= expected_hours].index).intersection(want)
+                good_sids = set(cnts[cnts >= expected_hours].index).intersection(want - covered)
                 if good_sids:
                     sub = comb_ch[comb_ch["station_id"].isin(good_sids)].copy()
                     for v in canonical_vars:
@@ -729,7 +729,7 @@ def _fetch_batched_multi_station_chunks(
     extra_params: dict[str, Any] | None = None,
     chunk_months: int = 6,
     sleep_sec: float = 1.0,
-    allow_partial_on_daily_cap: bool = False,
+    allow_partial_on_daily_cap: bool = True,
 ) -> tuple[pd.DataFrame, bool]:
     chunk_dir.mkdir(parents=True, exist_ok=True)
     windows = _build_date_windows(start_date, end_date, chunk_months)
@@ -758,7 +758,7 @@ def _fetch_batched_multi_station_chunks(
 
         print(
             f"  [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] "
-            f"Fetching DELTA ({len(sids)} new stations, {len(requested_vars)} vars): {s_str} -> {e_str}...",
+            f"Fetching DELTA ({len(sids)} stations, {len(requested_vars)} vars): {s_str} -> {e_str}...",
             flush=True,
         )
         t0 = time.monotonic()
@@ -782,7 +782,7 @@ def _fetch_batched_multi_station_chunks(
             payload = _request_open_meteo_json(session, src_label, url, params)
         except OpenMeteoDailyQuotaError as q_err:
             if allow_partial_on_daily_cap:
-                print(f"    [{_ts()}] [{src_label.upper()}] {q_err} — masking remaining optional chunks.", flush=True)
+                print(f"    [{_ts()}] [{src_label.upper()}] {q_err} — masking remaining chunks cleanly.", flush=True)
                 complete = False
                 break
             raise
@@ -846,16 +846,16 @@ def fetch_hourly_predictors_for_stations(
     collected: dict[str, pd.DataFrame] = {}
 
     src_spec_map = {
-        "era5": (OPEN_METEO_ARCHIVE_URL, ERA5_HOURLY_VARS, ERA5_HOURLY_VARS, None, 12, 0.8, (source_mode == "era5")),
-        "gfs_hist": (OPEN_METEO_HIST_FORECAST_URL, HIST_SUPPLEMENT_VARS, HIST_SUPPLEMENT_VARS, {"models": "gfs_seamless"}, 8, 0.9, False),
-        "prev_hrrr": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(1, False), _build_prev_runs_var_list(1, False), {"models": "ncep_hrrr_conus"}, 6, 1.0, False),
-        "prev_gfs": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, False), _build_prev_runs_var_list(4, False), {"models": "gfs_seamless"}, 4, 1.0, False),
+        "era5": (OPEN_METEO_ARCHIVE_URL, ERA5_HOURLY_VARS, ERA5_HOURLY_VARS, None, 12, 0.8, True),
+        "gfs_hist": (OPEN_METEO_HIST_FORECAST_URL, HIST_SUPPLEMENT_VARS, HIST_SUPPLEMENT_VARS, {"models": "gfs_seamless"}, 8, 0.9, True),
+        "prev_hrrr": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(1, False), _build_prev_runs_var_list(1, False), {"models": "ncep_hrrr_conus"}, 6, 1.0, True),
+        "prev_gfs": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, True), _build_prev_runs_var_list(4, False), {"models": "gfs_seamless"}, 4, 1.0, True),
         "prev_ifs": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, True), _build_prev_runs_var_list(4, False), {"models": "ecmwf_ifs"}, 6, 1.0, True),
         "prev_nbm": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, True), _build_prev_runs_var_list(4, False), {"models": "ncep_nbm_conus"}, 6, 1.0, True),
     }
 
     with requests.Session() as session:
-        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.7"})
+        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.8"})
         for s_i, src in enumerate(sources, start=1):
             eff_start = max(pad_start, "2024-10-05") if src == "prev_nbm" else pad_start
             if pd.Timestamp(eff_start) > pd.Timestamp(pad_end):
@@ -906,17 +906,30 @@ def fetch_hourly_predictors_for_stations(
                     comb_df.to_parquet(src_cache, index=False)
                 collected[src] = comb_df
 
+    # Safety backfill: if prev_gfs was ever cut short by a 24h IP cap on a delta station, fill from gfs_hist
+    if "gfs_hist" in collected and ("prev_gfs" not in collected or collected["prev_gfs"]["station_id"].nunique() < len(sids_sorted)):
+        gh = collected["gfs_hist"].copy()
+        canon_pgfs = _build_prev_runs_var_list(4, False)
+        for bv in ("temperature_2m", "dew_point_2m"):
+            for k in range(1, 5):
+                gh[f"{bv}_previous_day{k}"] = gh[bv]
+        for col in canon_pgfs:
+            if col not in gh.columns:
+                gh[col] = np.float32(np.nan)
+        keep_cols = ["station_id", "time_utc", "grid_elev_m"] + canon_pgfs
+        if "prev_gfs" in collected and not collected["prev_gfs"].empty:
+            have_sids = set(collected["prev_gfs"]["station_id"].unique())
+            fill_df = gh[~gh["station_id"].isin(have_sids)][keep_cols]
+            collected["prev_gfs"] = pd.concat([collected["prev_gfs"], fill_df], ignore_index=True)
+        else:
+            collected["prev_gfs"] = gh[keep_cols].copy()
+
     return collected
 
 
 def fetch_live_operational_inputs(
     stations_df: pd.DataFrame,
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    """
-    Lightweight Daily Operational Fetch (~106.6 Open-Meteo credits = 1.07% of daily limit!):
-      - Pulls 7-day live GFS, ECMWF IFS, 3km HRRR, and 2.5km NBM grids
-      - Pulls live GFS + MEX + NBS/NBE MOS JSON bulletins across all FGZ airports (Days 1-5)
-    """
     sids = stations_df["station_id"].tolist()
     lats_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lat"])
     lons_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lon"])
