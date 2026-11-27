@@ -1,8 +1,8 @@
 name: FGZ Operational AI-MOS & GitHub Pages Forecast
 
 on:
-  schedule:
-    - cron: "15 13 * * *"  # Daily at 13:15 UTC (06:15 AM MST, right after 12Z NBM & MOS arrive)
+  # schedule:
+  #  - cron: "15 13 * * *"  # Daily at 13:15 UTC (06:15 AM MST, right after 12Z NBM & MOS arrive)
   workflow_dispatch:
     inputs:
       mode:
