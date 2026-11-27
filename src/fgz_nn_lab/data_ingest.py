@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ ERA5_HOURLY_VARS = [
     "boundary_layer_height",
 ]
 
-NWP_HOURLY_VARS_BASE = [
+NWP_ALL_CANONICAL_VARS = [
     "temperature_2m",
     "dew_point_2m",
     "precipitation",
@@ -47,11 +48,74 @@ NWP_HOURLY_VARS_BASE = [
     "temperature_500hPa",
 ]
 
-NWP_MODELS = {
-    "hrrr": "ncep_hrrr_conus",
-    "gfs": "gfs_seamless",
-    "ifs": "ecmwf_ifs025",
+NWP_MODEL_SPECS: dict[str, dict[str, Any]] = {
+    "hrrr": {
+        "model_code": "ncep_hrrr_conus",
+        "vars": [
+            "temperature_2m",
+            "dew_point_2m",
+            "precipitation",
+            "snow_depth",
+            "cloud_cover",
+            "cloud_cover_low",
+            "shortwave_radiation",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "boundary_layer_height",
+            "temperature_850hPa",
+            "temperature_700hPa",
+            "temperature_500hPa",
+        ],
+    },
+    "gfs": {
+        "model_code": "gfs_seamless",
+        "vars": [
+            "temperature_2m",
+            "dew_point_2m",
+            "precipitation",
+            "snow_depth",
+            "cloud_cover",
+            "cloud_cover_low",
+            "shortwave_radiation",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "boundary_layer_height",
+            "temperature_850hPa",
+            "temperature_700hPa",
+            "temperature_500hPa",
+        ],
+    },
+    "ifs": {
+        "model_code": "ecmwf_ifs",
+        "vars": [
+            "temperature_2m",
+            "dew_point_2m",
+            "precipitation",
+            "snow_depth",
+            "cloud_cover",
+            "cloud_cover_low",
+            "shortwave_radiation",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "temperature_850hPa",
+            "temperature_700hPa",
+            "temperature_500hPa",
+        ],
+    },
 }
+
+MINIMAL_FALLBACK_VARS = [
+    "temperature_2m",
+    "dew_point_2m",
+    "precipitation",
+    "cloud_cover",
+    "shortwave_radiation",
+    "wind_speed_10m",
+]
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
 def load_station_catalog(config_path: Path) -> pd.DataFrame:
@@ -113,11 +177,24 @@ def fetch_iem_coop_observations(
     raw_dir.mkdir(parents=True, exist_ok=True)
     cache_file = raw_dir / f"coop_qc_{start_date}_{end_date}.parquet"
     if cache_file.exists():
-        return pd.read_parquet(cache_file)
+        df_cached = pd.read_parquet(cache_file)
+        print(
+            f"  [{_ts()}] [COOP] Cache HIT -> {cache_file.name} "
+            f"({len(df_cached):,} rows across {df_cached['station_id'].nunique()} stations)",
+            flush=True,
+        )
+        return df_cached
 
     dt_start = pd.Timestamp(start_date)
     dt_end = pd.Timestamp(end_date)
     station_ids = stations_df["station_id"].tolist()
+
+    print(
+        f"  [{_ts()}] [COOP] Downloading IEM AZCLIMATE observations for {len(station_ids)} stations "
+        f"({start_date} -> {end_date})...",
+        flush=True,
+    )
+    t0 = time.monotonic()
 
     params = {
         "network": "AZCLIMATE",
@@ -167,89 +244,192 @@ def fetch_iem_coop_observations(
     ).reset_index(drop=True)
 
     qc_df.to_parquet(cache_file, index=False)
+    print(
+        f"  [{_ts()}] [COOP] Saved {len(qc_df):,} QC-clean rows across {len(valid_sids)} active stations "
+        f"in {time.monotonic() - t0:.1f}s",
+        flush=True,
+    )
     return qc_df
 
 
 def _request_open_meteo_json(
+    session: requests.Session,
+    src_label: str,
     url: str,
     params: dict[str, Any],
-    retries: int = 7,
-    read_timeout: int = 180,
-) -> dict[str, Any]:
-    delay = 2.5
+    retries: int = 6,
+    read_timeout: int = 120,
+) -> Any:
+    delay = 3.0
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, timeout=(20, read_timeout))
+            resp = session.get(url, params=params, timeout=(15, read_timeout))
             if resp.status_code == 200:
                 return resp.json()
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+            if resp.status_code == 429 and attempt < retries - 1:
+                retry_after = float(resp.headers.get("Retry-After", delay * 2.0))
+                wait_s = min(max(retry_after, delay), 65.0)
+                print(
+                    f"    [{_ts()}] [{src_label}] HTTP 429 rate-limit; sleeping {wait_s:.1f}s "
+                    f"(attempt {attempt + 1}/{retries})...",
+                    flush=True,
+                )
+                time.sleep(wait_s)
+                delay = min(delay * 2.0, 60.0)
+                continue
+            if resp.status_code in (500, 502, 503, 504) and attempt < retries - 1:
+                print(
+                    f"    [{_ts()}] [{src_label}] HTTP {resp.status_code}; retrying in {delay:.1f}s "
+                    f"(attempt {attempt + 1}/{retries})...",
+                    flush=True,
+                )
                 time.sleep(delay)
-                delay = min(delay * 2.0, 40.0)
+                delay = min(delay * 2.0, 45.0)
                 continue
             resp.raise_for_status()
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             if attempt < retries - 1:
+                print(
+                    f"    [{_ts()}] [{src_label}] {type(exc).__name__}; retrying in {delay:.1f}s "
+                    f"(attempt {attempt + 1}/{retries})...",
+                    flush=True,
+                )
                 time.sleep(delay)
-                delay = min(delay * 2.0, 40.0)
+                delay = min(delay * 2.0, 45.0)
                 continue
             raise
     raise RuntimeError(f"Open-Meteo request failed for {url}")
 
 
-def _fetch_chunked_hourly(
-    url: str,
-    lat: float,
-    lon: float,
-    start_date: str,
-    end_date: str,
-    hourly_vars: list[str],
-    extra_params: dict[str, Any] | None = None,
-    chunk_months: int = 12,
-    sleep_sec: float = 0.6,
-    read_timeout: int = 180,
-) -> tuple[pd.DataFrame, float]:
-    """Fetch hourly series in date chunks with elevation=nan to preserve true grid elevation."""
+def _build_date_windows(start_date: str, end_date: str, chunk_months: int) -> list[tuple[str, str]]:
     dt_start = pd.Timestamp(start_date)
     dt_end = pd.Timestamp(end_date)
-    frames: list[pd.DataFrame] = []
-    grid_elev_m = np.nan
-
+    windows: list[tuple[str, str]] = []
     cur = dt_start
     while cur <= dt_end:
         chunk_end = min(cur + pd.DateOffset(months=chunk_months) - pd.Timedelta(days=1), dt_end)
+        windows.append((cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        cur = chunk_end + pd.Timedelta(days=1)
+    return windows
+
+
+def _fetch_batched_multi_station_chunks(
+    session: requests.Session,
+    src_label: str,
+    url: str,
+    stations_df: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    requested_vars: list[str],
+    canonical_vars: list[str],
+    chunk_dir: Path,
+    extra_params: dict[str, Any] | None = None,
+    chunk_months: int = 6,
+    sleep_sec: float = 0.8,
+) -> pd.DataFrame:
+    """
+    Fetches ALL stations simultaneously in a single multi-coordinate Open-Meteo call per time chunk,
+    streaming clear progress updates on every chunk and caching each chunk immediately.
+    """
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    windows = _build_date_windows(start_date, end_date, chunk_months)
+    total_chunks = len(windows)
+
+    sids = stations_df["station_id"].tolist()
+    lats_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lat"])
+    lons_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lon"])
+    elev_csv = ",".join(["nan"] * len(sids))
+
+    chunk_frames: list[pd.DataFrame] = []
+    src_t0 = time.monotonic()
+
+    for idx, (s_str, e_str) in enumerate(windows, start=1):
+        chunk_file = chunk_dir / f"chunk_{src_label}_{s_str}_{e_str}_{len(sids)}st.parquet"
+
+        if chunk_file.exists():
+            print(
+                f"  [{_ts()}] [{src_label.upper():4s} {idx:02d}/{total_chunks:02d}] "
+                f"Cache HIT  {s_str} -> {e_str}",
+                flush=True,
+            )
+            chunk_frames.append(pd.read_parquet(chunk_file))
+            continue
+
+        print(
+            f"  [{_ts()}] [{src_label.upper():4s} {idx:02d}/{total_chunks:02d}] "
+            f"Requesting {s_str} -> {e_str} ({len(sids)} stations batched, {len(requested_vars)} vars)...",
+            flush=True,
+        )
+        t0 = time.monotonic()
+
+        active_vars = list(requested_vars)
         params: dict[str, Any] = {
-            "latitude": lat,
-            "longitude": lon,
-            "start_date": cur.strftime("%Y-%m-%d"),
-            "end_date": chunk_end.strftime("%Y-%m-%d"),
-            "hourly": ",".join(hourly_vars),
+            "latitude": lats_csv,
+            "longitude": lons_csv,
+            "start_date": s_str,
+            "end_date": e_str,
+            "hourly": ",".join(active_vars),
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
             "precipitation_unit": "inch",
             "timezone": "UTC",
-            "elevation": "nan",
+            "elevation": elev_csv,
         }
         if extra_params:
             params.update(extra_params)
 
-        payload = _request_open_meteo_json(url, params, retries=7, read_timeout=read_timeout)
-        if np.isnan(grid_elev_m) and "elevation" in payload and payload["elevation"] is not None:
-            grid_elev_m = float(payload["elevation"])
-
-        hourly = payload.get("hourly", {})
-        cdf = pd.DataFrame({"time_utc": pd.to_datetime(hourly["time"])})
-        for v in hourly_vars:
-            if v in hourly:
-                cdf[v] = pd.to_numeric(hourly[v], errors="coerce")
+        try:
+            payload = _request_open_meteo_json(session, src_label, url, params)
+        except requests.HTTPError as err:
+            if err.response is not None and err.response.status_code == 400 and active_vars != MINIMAL_FALLBACK_VARS:
+                print(
+                    f"    [{_ts()}] [{src_label.upper()}] HTTP 400 on full var list for {s_str}..{e_str}; "
+                    f"retrying core vars...",
+                    flush=True,
+                )
+                active_vars = list(MINIMAL_FALLBACK_VARS)
+                params["hourly"] = ",".join(active_vars)
+                payload = _request_open_meteo_json(session, src_label, url, params)
             else:
-                cdf[v] = np.nan
-        frames.append(cdf)
-        cur = chunk_end + pd.Timedelta(days=1)
+                raise
+
+        items = payload if isinstance(payload, list) else [payload]
+        if len(items) != len(sids):
+            raise RuntimeError(f"Expected {len(sids)} station payloads from Open-Meteo, got {len(items)}")
+
+        loc_dfs: list[pd.DataFrame] = []
+        for sid, item in zip(sids, items):
+            hourly = item.get("hourly", {})
+            grid_elev = float(item["elevation"]) if item.get("elevation") is not None else np.nan
+            cdf = pd.DataFrame({"time_utc": pd.to_datetime(hourly["time"])})
+            for v in canonical_vars:
+                if v in hourly:
+                    cdf[v] = pd.to_numeric(hourly[v], errors="coerce").astype(np.float32)
+                else:
+                    cdf[v] = np.float32(np.nan)
+            cdf["grid_elev_m"] = np.float32(grid_elev)
+            cdf["station_id"] = sid
+            loc_dfs.append(cdf)
+
+        chunk_df = pd.concat(loc_dfs, ignore_index=True)
+        chunk_df.to_parquet(chunk_file, index=False)
+        chunk_frames.append(chunk_df)
+        dt_chunk = time.monotonic() - t0
+        total_elapsed = time.monotonic() - src_t0
+        print(
+            f"    [{_ts()}] [{src_label.upper():4s} {idx:02d}/{total_chunks:02d}] "
+            f"Saved {len(chunk_df):,} rows in {dt_chunk:.1f}s (source elapsed: {total_elapsed:.0f}s)",
+            flush=True,
+        )
         time.sleep(sleep_sec)
 
-    full_df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["time_utc"]).sort_values("time_utc")
-    full_df["grid_elev_m"] = grid_elev_m
-    return full_df.reset_index(drop=True), grid_elev_m
+    full_df = (
+        pd.concat(chunk_frames, ignore_index=True)
+        .drop_duplicates(subset=["station_id", "time_utc"])
+        .sort_values(["station_id", "time_utc"])
+        .reset_index(drop=True)
+    )
+    return full_df
 
 
 def fetch_hourly_predictors_for_stations(
@@ -259,14 +439,8 @@ def fetch_hourly_predictors_for_stations(
     raw_dir: Path,
     source_mode: str = "era5",
 ) -> dict[str, pd.DataFrame]:
-    """
-    Returns dict mapping source_name -> DataFrame of hourly predictors across all stations.
-    source_mode='era5' fetches ERA5 archive.
-    source_mode='nwp_hybrid' fetches ERA5 + archived HRRR, GFS, and ECMWF IFS runs.
-    """
     raw_dir.mkdir(parents=True, exist_ok=True)
-    st_cache_dir = raw_dir / "per_station"
-    st_cache_dir.mkdir(parents=True, exist_ok=True)
+    chunk_dir = raw_dir / "chunks"
     pad_end = (pd.Timestamp(end_date) + pd.Timedelta(days=6)).strftime("%Y-%m-%d")
 
     sources_to_pull = ["era5"]
@@ -275,78 +449,60 @@ def fetch_hourly_predictors_for_stations(
 
     collected: dict[str, pd.DataFrame] = {}
 
-    for src in sources_to_pull:
-        src_cache = raw_dir / f"hourly_{src}_{start_date}_{pad_end}_{len(stations_df)}st.parquet"
-        if src_cache.exists():
-            collected[src] = pd.read_parquet(src_cache)
-            continue
-
-        st_frames: list[pd.DataFrame] = []
-        for _, st in stations_df.iterrows():
-            sid = st["station_id"]
-            one_st_cache = st_cache_dir / f"hourly_{src}_{sid}_{start_date}_{pad_end}.parquet"
-            if one_st_cache.exists():
-                st_frames.append(pd.read_parquet(one_st_cache))
+    with requests.Session() as session:
+        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.3"})
+        for s_i, src in enumerate(sources_to_pull, start=1):
+            src_cache = raw_dir / f"hourly_{src}_{start_date}_{pad_end}_{len(stations_df)}st.parquet"
+            print(
+                f"  [{_ts()}] === Source [{s_i}/{len(sources_to_pull)}]: {src.upper()} "
+                f"({start_date} -> {pad_end}) ===",
+                flush=True,
+            )
+            if src_cache.exists():
+                df_cached = pd.read_parquet(src_cache)
+                print(
+                    f"  [{_ts()}] [{src.upper()}] Full cache HIT -> {src_cache.name} ({len(df_cached):,} rows)",
+                    flush=True,
+                )
+                collected[src] = df_cached
                 continue
 
             if src == "era5":
-                df_st, _ = _fetch_chunked_hourly(
+                full_src_df = _fetch_batched_multi_station_chunks(
+                    session=session,
+                    src_label="era5",
                     url=OPEN_METEO_ARCHIVE_URL,
-                    lat=float(st["lat"]),
-                    lon=float(st["lon"]),
+                    stations_df=stations_df,
                     start_date=start_date,
                     end_date=pad_end,
-                    hourly_vars=ERA5_HOURLY_VARS,
+                    requested_vars=ERA5_HOURLY_VARS,
+                    canonical_vars=ERA5_HOURLY_VARS,
+                    chunk_dir=chunk_dir,
                     chunk_months=12,
                     sleep_sec=0.6,
-                    read_timeout=180,
                 )
             else:
-                model_code = NWP_MODELS[src]
-                try:
-                    df_st, _ = _fetch_chunked_hourly(
-                        url=OPEN_METEO_HIST_FORECAST_URL,
-                        lat=float(st["lat"]),
-                        lon=float(st["lon"]),
-                        start_date=start_date,
-                        end_date=pad_end,
-                        hourly_vars=NWP_HOURLY_VARS_BASE,
-                        extra_params={"models": model_code},
-                        chunk_months=3,
-                        sleep_sec=1.2,
-                        read_timeout=180,
-                    )
-                except requests.HTTPError:
-                    minimal_vars = [
-                        "temperature_2m",
-                        "dew_point_2m",
-                        "precipitation",
-                        "cloud_cover",
-                        "shortwave_radiation",
-                        "wind_speed_10m",
-                    ]
-                    df_st, _ = _fetch_chunked_hourly(
-                        url=OPEN_METEO_HIST_FORECAST_URL,
-                        lat=float(st["lat"]),
-                        lon=float(st["lon"]),
-                        start_date=start_date,
-                        end_date=pad_end,
-                        hourly_vars=minimal_vars,
-                        extra_params={"models": model_code},
-                        chunk_months=3,
-                        sleep_sec=1.2,
-                        read_timeout=180,
-                    )
-                    for missing_col in NWP_HOURLY_VARS_BASE:
-                        if missing_col not in df_st.columns:
-                            df_st[missing_col] = np.nan
+                spec = NWP_MODEL_SPECS[src]
+                full_src_df = _fetch_batched_multi_station_chunks(
+                    session=session,
+                    src_label=src,
+                    url=OPEN_METEO_HIST_FORECAST_URL,
+                    stations_df=stations_df,
+                    start_date=start_date,
+                    end_date=pad_end,
+                    requested_vars=spec["vars"],
+                    canonical_vars=NWP_ALL_CANONICAL_VARS,
+                    chunk_dir=chunk_dir,
+                    extra_params={"models": spec["model_code"]},
+                    chunk_months=6,
+                    sleep_sec=0.9,
+                )
 
-            df_st["station_id"] = sid
-            df_st.to_parquet(one_st_cache, index=False)
-            st_frames.append(df_st)
-
-        full_src_df = pd.concat(st_frames, ignore_index=True)
-        full_src_df.to_parquet(src_cache, index=False)
-        collected[src] = full_src_df
+            full_src_df.to_parquet(src_cache, index=False)
+            print(
+                f"  [{_ts()}] [{src.upper()}] Completed & wrote {src_cache.name} ({len(full_src_df):,} rows)",
+                flush=True,
+            )
+            collected[src] = full_src_df
 
     return collected
