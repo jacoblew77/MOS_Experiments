@@ -15,6 +15,7 @@ def compute_metrics_bundle(
     station_ids: np.ndarray,
     tiers: np.ndarray,
     snow_flag: np.ndarray,
+    networks: np.ndarray | None = None,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     abs_err = np.abs(y_pred - y_true)
     min_err = abs_err[:, :, 0]
@@ -30,6 +31,19 @@ def compute_metrics_bundle(
         summary[f"mae_max_d{d + 1}"] = float(max_err[:, d].mean())
 
     slice_rows: list[dict[str, Any]] = []
+
+    if networks is not None:
+        for net in np.unique(networks):
+            m = networks == net
+            slice_rows.append(
+                {
+                    "slice_type": "network",
+                    "slice_name": str(net),
+                    "samples": int(m.sum() * 5),
+                    "mae_min": round(float(min_err[m].mean()), 4),
+                    "mae_max": round(float(max_err[m].mean()), 4),
+                }
+            )
 
     freeze_mask = y_true[:, :, 0] <= 32.0
     if freeze_mask.any():
@@ -140,62 +154,35 @@ def write_single_file_master_bundle(
     source_mode: str,
     coop_audit_df: pd.DataFrame,
     channel_coverage_df: pd.DataFrame,
-) -> tuple[Path, Path]:
-    """
-    Consolidates EVERY leaderboard row, EVERY stratified slice table, station QC survival audit,
-    and channel missingness/gating diagnostics into ONE single JSON file and ONE flat CSV file
-    so uploading 1 file gives 100% visibility.
-    """
+    live_forecasts: list[dict[str, Any]] | None = None,
+) -> Path:
+    """Writes ONE single master_analysis_bundle.json containing all leaderboards, slices, audits, and live 5-day forecasts."""
     runs_dir.mkdir(parents=True, exist_ok=True)
     leaderboard_path = runs_dir / "leaderboard.csv"
     lb_df = pd.read_csv(leaderboard_path) if leaderboard_path.exists() else pd.DataFrame()
 
-    all_strat_frames: list[pd.DataFrame] = []
     run_details: dict[str, Any] = {}
-
     for sub in sorted(runs_dir.iterdir()):
         if not sub.is_dir():
             continue
         m_json = sub / "metrics_summary.json"
         m_strat = sub / "metrics_stratified.csv"
         if m_json.exists() and m_strat.exists():
-            meta = json.loads(m_json.read_text(encoding="utf-8"))
-            sdf = pd.read_csv(m_strat)
-            sdf_tagged = sdf.copy()
-            sdf_tagged.insert(0, "run_id", sub.name)
-            all_strat_frames.append(sdf_tagged)
             run_details[sub.name] = {
-                "summary": meta,
-                "stratified": sdf.to_dict(orient="records"),
+                "summary": json.loads(m_json.read_text(encoding="utf-8")),
+                "stratified": pd.read_csv(m_strat).to_dict(orient="records"),
             }
 
     master_json_path = runs_dir / "master_analysis_bundle.json"
     bundle_obj = {
         "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source_mode": source_mode,
+        "observation_guarantee": "IEM daily.py (na=blank, AZ_COOP + AZ_ASOS) + temp_estimated purge — 0% spatially estimated obs",
         "station_qc_audit": coop_audit_df.to_dict(orient="records"),
         "channel_coverage": channel_coverage_df.to_dict(orient="records"),
         "leaderboard": lb_df.to_dict(orient="records"),
         "runs": run_details,
+        "live_5day_operational_forecasts": live_forecasts or [],
     }
     master_json_path.write_text(json.dumps(bundle_obj, indent=2), encoding="utf-8")
-
-    master_csv_path = runs_dir / "master_all_tables.csv"
-    flat_frames: list[pd.DataFrame] = []
-    if not lb_df.empty:
-        lb_flat = lb_df.copy()
-        lb_flat.insert(0, "record_type", "leaderboard")
-        flat_frames.append(lb_flat)
-    if all_strat_frames:
-        st_flat = pd.concat(all_strat_frames, ignore_index=True)
-        st_flat.insert(0, "record_type", "stratified")
-        flat_frames.append(st_flat)
-    if not coop_audit_df.empty:
-        aud_flat = coop_audit_df.copy()
-        aud_flat.insert(0, "record_type", "station_qc_audit")
-        flat_frames.append(aud_flat)
-
-    if flat_frames:
-        pd.concat(flat_frames, ignore_index=True).to_csv(master_csv_path, index=False)
-
-    return master_json_path, master_csv_path
+    return master_json_path

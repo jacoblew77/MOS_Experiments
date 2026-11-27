@@ -1,30 +1,28 @@
 seed: 42
 
 dates:
-  era5_start: "2016-01-01"
-  era5_end: "2026-10-31"
-  nwp_start: "2022-01-01"
-  nwp_end: "2026-10-31"
+  era5_start: "2017-01-01"
+  era5_end: "2026-11-15"
   true_lead_start: "2024-01-05"
-  true_lead_end: "2026-10-31"
-  smoke_start: "2024-01-05"
+  true_lead_end: "2026-11-15"
+  smoke_start: "2024-06-01"
   smoke_end: "2025-12-31"
 
 qc_and_gating:
-  min_clean_obs_days_era5: 730
-  min_clean_obs_days_nwp: 365
-  min_clean_obs_days_lead: 300
-  issue_hour_utc: 12         # 12:00Z = 05:00 MST daily forecast cycle
+  min_clean_obs_days_era5: 700
+  min_clean_obs_days_lead: 380
+  min_recent_year_days: 150  # Prevents half-retired stations from contaminating test slices
+  issue_hour_utc: 12         # 12:00Z = 05:00 MST operational cycle
   morning_min_gate_utc: 15   # Hold Today's Morning Min until >= 15:00Z (08:00 MST)
   afternoon_max_gate_utc: 23 # Hold Today's Afternoon Max until >= 23:00Z (16:00 MST)
-  min_causal_lag_hours: 48   # Strict causal lag safety floor
+  min_causal_lag_hours: 48
 
 splits:
-  purge_days: 6              # Prevents 5-day horizon + lag leakage across fold breaks
-  test_days: 365             # Final chronological year held out (auto-scales on shorter windows)
-  val_folds: 2               # Expanding temporal validation folds prior to test split
-  val_fold_days: 300
-  min_valid_channel_samples: 150
+  purge_days: 6
+  test_days: 330
+  val_folds: 2
+  val_fold_days: 240
+  min_valid_channel_samples: 120
   clip_zscore: 8.0
 
 nn:
@@ -38,7 +36,7 @@ nn:
   weight_decay: 0.0008
   batch_size: 128
   max_epochs: 45
-  pretrain_epochs: 30
+  pretrain_epochs: 28
   warmup_smooth_l1_epochs: 6
   smooth_l1_beta: 2.0
   patience: 8

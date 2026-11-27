@@ -18,6 +18,33 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
+def fit_l1_optimal_blend_weights(
+    pred_a_val: np.ndarray,
+    pred_b_val: np.ndarray,
+    y_val: np.ndarray,
+) -> np.ndarray:
+    """
+    Finds exact L1-optimal convex weight w in [0, 1] per horizon (d=0..4) and extremum (0=Min, 1=Max)
+    strictly on validation predictions so pred_stack = w * pred_a + (1 - w) * pred_b minimizes MAE.
+    """
+    weights = np.zeros((5, 2), dtype=np.float32)
+    grid = np.linspace(0.0, 1.0, 101, dtype=np.float32)
+    for d in range(5):
+        for t_i in range(2):
+            pa = pred_a_val[:, d, t_i][:, None]
+            pb = pred_b_val[:, d, t_i][:, None]
+            yt = y_val[:, d, t_i][:, None]
+            blended = grid[None, :] * pa + (1.0 - grid[None, :]) * pb
+            maes = np.abs(blended - yt).mean(axis=0)
+            weights[d, t_i] = float(grid[int(np.argmin(maes))])
+    return weights
+
+
+def apply_blend_weights(pred_a: np.ndarray, pred_b: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    w = weights[None, :, :]
+    return (w * pred_a + (1.0 - w) * pred_b).astype(np.float32)
+
+
 def fit_predict_ridge_baseline(
     x_dyn_tr: np.ndarray,
     mask_tr: np.ndarray,
@@ -61,27 +88,23 @@ def fit_predict_lgbm_baseline(
     anchor_ev: np.ndarray,
     seed: int = 42,
     fold_label: str = "",
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[list[lgb.LGBMRegressor]]]:
     val_preds = np.zeros_like(anchor_va, dtype=np.float32)
     ev_preds = np.zeros_like(anchor_ev, dtype=np.float32)
+    fitted_models: list[list[lgb.LGBMRegressor]] = []
     t0 = time.monotonic()
 
     for d in range(5):
-        f_tr = np.concatenate(
-            [x_dyn_tr[:, d, :], mask_tr[:, d, :], x_ctx_tr, st_idx_tr[:, None], anchor_tr[:, d, :]], axis=1
-        )
-        f_va = np.concatenate(
-            [x_dyn_va[:, d, :], mask_va[:, d, :], x_ctx_va, st_idx_va[:, None], anchor_va[:, d, :]], axis=1
-        )
-        f_ev = np.concatenate(
-            [x_dyn_ev[:, d, :], mask_ev[:, d, :], x_ctx_ev, st_idx_ev[:, None], anchor_ev[:, d, :]], axis=1
-        )
+        f_tr = np.concatenate([x_dyn_tr[:, d, :], mask_tr[:, d, :], x_ctx_tr, st_idx_tr[:, None], anchor_tr[:, d, :]], axis=1)
+        f_va = np.concatenate([x_dyn_va[:, d, :], mask_va[:, d, :], x_ctx_va, st_idx_va[:, None], anchor_va[:, d, :]], axis=1)
+        f_ev = np.concatenate([x_dyn_ev[:, d, :], mask_ev[:, d, :], x_ctx_ev, st_idx_ev[:, None], anchor_ev[:, d, :]], axis=1)
+        day_models: list[lgb.LGBMRegressor] = []
         for target_i in range(2):
             res_tr = y_tr[:, d, target_i] - anchor_tr[:, d, target_i]
             res_va = y_va[:, d, target_i] - anchor_va[:, d, target_i]
             gbm = lgb.LGBMRegressor(
                 objective="regression_l1",
-                n_estimators=500,
+                n_estimators=550,
                 learning_rate=0.035,
                 num_leaves=31,
                 subsample_for_bin=50000,
@@ -92,20 +115,29 @@ def fit_predict_lgbm_baseline(
                 n_jobs=-1,
                 verbose=-1,
             )
-            gbm.fit(
-                f_tr,
-                res_tr,
-                eval_set=[(f_va, res_va)],
-                callbacks=[lgb.early_stopping(35, verbose=False)],
-            )
+            gbm.fit(f_tr, res_tr, eval_set=[(f_va, res_va)], callbacks=[lgb.early_stopping(35, verbose=False)])
             val_preds[:, d, target_i] = anchor_va[:, d, target_i] + gbm.predict(f_va).astype(np.float32)
             ev_preds[:, d, target_i] = anchor_ev[:, d, target_i] + gbm.predict(f_ev).astype(np.float32)
+            day_models.append(gbm)
+        fitted_models.append(day_models)
+        print(f"      [{_ts()}] [LGBM {fold_label}] Day {d + 1}/5 Min+Max trees fitted ({time.monotonic() - t0:.1f}s)", flush=True)
+    return val_preds, ev_preds, fitted_models
 
-        print(
-            f"      [{_ts()}] [LGBM {fold_label}] Day {d + 1}/5 Min+Max trees fitted ({time.monotonic() - t0:.1f}s)",
-            flush=True,
-        )
-    return val_preds, ev_preds
+
+def predict_lgbm_grid(
+    models_grid: list[list[lgb.LGBMRegressor]],
+    x_dyn: np.ndarray,
+    mask_dyn: np.ndarray,
+    x_ctx: np.ndarray,
+    st_idx: np.ndarray,
+    anchor: np.ndarray,
+) -> np.ndarray:
+    out = np.zeros_like(anchor, dtype=np.float32)
+    for d in range(5):
+        f_ev = np.concatenate([x_dyn[:, d, :], mask_dyn[:, d, :], x_ctx, st_idx[:, None], anchor[:, d, :]], axis=1)
+        for t_i in range(2):
+            out[:, d, t_i] = anchor[:, d, t_i] + models_grid[d][t_i].predict(f_ev).astype(np.float32)
+    return out
 
 
 class ResidualTemporalBlock(nn.Module):
@@ -131,7 +163,7 @@ class FGZMultiHorizonResNet(nn.Module):
         self,
         dyn_dim: int,
         ctx_dim: int,
-        num_stations: int = 16,
+        num_stations: int = 24,
         hidden_dim: int = 96,
         ctx_embed_dim: int = 32,
         station_embed_dim: int = 12,
@@ -224,8 +256,7 @@ class FGZMultiHorizonResNet(nn.Module):
 
         delta_min = self.min_head(joint).squeeze(-1)
         delta_max = self.max_head(joint).squeeze(-1)
-        deltas = torch.stack([delta_min, delta_max], dim=-1)
-        return anchor + deltas
+        return anchor + torch.stack([delta_min, delta_max], dim=-1)
 
 
 def compute_extremum_loss(
@@ -246,9 +277,8 @@ def compute_extremum_loss(
         err_max = torch.abs(pred[:, :, 1] - target[:, :, 1])
 
     weighted = horizon_weights.unsqueeze(0) * (min_weight * err_min + max_weight * err_max)
-    base_loss = weighted.mean()
     crossing = F.relu(pred[:, :, 0] - pred[:, :, 1] + 0.5).mean()
-    return base_loss + crossing_weight * crossing
+    return weighted.mean() + crossing_weight * crossing
 
 
 def train_and_predict_nn(
@@ -270,7 +300,7 @@ def train_and_predict_nn(
     st_idx_ev: np.ndarray,
     anchor_ev: np.ndarray,
     nn_cfg: dict[str, Any],
-    num_stations: int = 16,
+    num_stations: int = 24,
     seed: int = 42,
     fold_label: str = "",
     pretrained_state_dict: dict[str, Any] | None = None,
@@ -299,11 +329,7 @@ def train_and_predict_nn(
     lr = float(nn_cfg.get("finetune_lr", 4e-4)) if is_finetune else float(nn_cfg.get("lr", 1e-3))
     max_epochs = override_epochs if override_epochs is not None else int(nn_cfg.get("max_epochs", 45))
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=float(nn_cfg.get("weight_decay", 8e-4)),
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(nn_cfg.get("weight_decay", 8e-4)))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
 
     ds_tr = TensorDataset(
@@ -314,20 +340,12 @@ def train_and_predict_nn(
         torch.from_numpy(anchor_tr),
         torch.from_numpy(y_tr),
     )
-    loader_tr = DataLoader(
-        ds_tr,
-        batch_size=int(nn_cfg.get("batch_size", 128)),
-        shuffle=True,
-        drop_last=False,
-    )
+    loader_tr = DataLoader(ds_tr, batch_size=int(nn_cfg.get("batch_size", 128)), shuffle=True, drop_last=False)
 
     h_weights = torch.tensor(nn_cfg.get("horizon_weights", [1.0] * 5), dtype=torch.float32, device=device)
     warmup_epochs = 0 if is_finetune else int(nn_cfg.get("warmup_smooth_l1_epochs", 6))
     smooth_beta = float(nn_cfg.get("smooth_l1_beta", 2.0))
     patience = int(nn_cfg.get("patience", 8))
-    min_w = float(nn_cfg.get("min_weight", 1.0))
-    max_w = float(nn_cfg.get("max_weight", 1.0))
-    cross_w = float(nn_cfg.get("crossing_penalty_weight", 0.20))
 
     t_va = (
         torch.from_numpy(x_dyn_va).to(device),
@@ -347,29 +365,18 @@ def train_and_predict_nn(
         model.train()
         use_smooth = epoch <= warmup_epochs
         for bx_dyn, bm_dyn, bx_ctx, bs_idx, b_anc, by in loader_tr:
-            bx_dyn = bx_dyn.to(device)
-            bm_dyn = bm_dyn.to(device)
-            bx_ctx = bx_ctx.to(device)
-            bs_idx = bs_idx.to(device)
-            b_anc = b_anc.to(device)
-            by = by.to(device)
-
             optimizer.zero_grad()
-            pred = model(bx_dyn, bm_dyn, bx_ctx, bs_idx, b_anc)
+            pred = model(bx_dyn.to(device), bm_dyn.to(device), bx_ctx.to(device), bs_idx.to(device), b_anc.to(device))
             loss = compute_extremum_loss(
-                pred,
-                by,
-                horizon_weights=h_weights,
-                min_weight=min_w,
-                max_weight=max_w,
-                use_smooth_l1=use_smooth,
-                smooth_beta=smooth_beta,
-                crossing_weight=cross_w,
+                pred, by.to(device), horizon_weights=h_weights,
+                min_weight=float(nn_cfg.get("min_weight", 1.0)),
+                max_weight=float(nn_cfg.get("max_weight", 1.0)),
+                use_smooth_l1=use_smooth, smooth_beta=smooth_beta,
+                crossing_weight=float(nn_cfg.get("crossing_penalty_weight", 0.20)),
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
-
         scheduler.step()
 
         model.eval()
@@ -393,17 +400,10 @@ def train_and_predict_nn(
             tag = "*best*" if improved else f"stale {stale_epochs}/{patience}"
             print(
                 f"      [{_ts()}] [NN {fold_label}] Ep {epoch:02d}/{max_epochs:02d} | "
-                f"Val Min: {val_min_mae:.3f}F | Val Max: {val_max_mae:.3f}F | "
-                f"Combined: {val_mae:.3f}F ({tag}, {time.monotonic() - t0:.1f}s)",
+                f"Val Min: {val_min_mae:.3f}F | Val Max: {val_max_mae:.3f}F | Combined: {val_mae:.3f}F ({tag}, {time.monotonic() - t0:.1f}s)",
                 flush=True,
             )
-
         if stale_epochs >= patience:
-            print(
-                f"      [{_ts()}] [NN {fold_label}] Early stop at ep {epoch} "
-                f"(best ep {best_epoch}: {best_val_mae:.3f}F)",
-                flush=True,
-            )
             break
 
     model.load_state_dict(best_state)

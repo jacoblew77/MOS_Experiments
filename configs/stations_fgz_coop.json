@@ -1,107 +1,124 @@
 {
-  "_network": "AZCLIMATE",
-  "_notes": "Curated active long-record FGZ COOP stations; AZ6471 Phantom Ranch corrected to 2530 ft.",
+  "_notes": "Seed & override catalog for WFO Flagstaff (FGZ) AZ_COOP + AZ_ASOS auto-discovery. Phantom Ranch (PHRA3) locked to 2530 ft.",
+  "auto_discover_fgz": true,
+  "max_coop_stations": 12,
+  "max_asos_stations": 8,
   "elevation_overrides_ft": {
+    "PHRA3": 2530.0,
     "AZ6471": 2530.0
   },
-  "stations": [
+  "exclude_stations": [
+    "AZ0000"
+  ],
+  "seed_stations": [
     {
-      "station_id": "AZ0678",
-      "name": "Bellemont WFO Flagstaff",
-      "lat": 35.2372,
-      "lon": -111.8222,
+      "station_id": "FLG",
+      "mos_id": "KFLG",
+      "network": "AZ_ASOS",
+      "name": "Flagstaff Pulliam ASOS",
+      "lat": 35.1403,
+      "lon": -111.6712,
+      "elev_ft": 7011.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "PRC",
+      "mos_id": "KPRC",
+      "network": "AZ_ASOS",
+      "name": "Prescott Love Field ASOS",
+      "lat": 34.6515,
+      "lon": -112.4208,
+      "elev_ft": 5045.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "INW",
+      "mos_id": "KINW",
+      "network": "AZ_ASOS",
+      "name": "Winslow Lindbergh ASOS",
+      "lat": 35.0219,
+      "lon": -110.7225,
+      "elev_ft": 4886.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "SJN",
+      "mos_id": "KSJN",
+      "network": "AZ_ASOS",
+      "name": "Saint Johns Industrial ASOS",
+      "lat": 34.5186,
+      "lon": -109.3789,
+      "elev_ft": 5737.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "GCN",
+      "mos_id": "KGCN",
+      "network": "AZ_ASOS",
+      "name": "Grand Canyon Park ASOS",
+      "lat": 35.9524,
+      "lon": -112.1470,
+      "elev_ft": 6609.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "PGA",
+      "mos_id": "KPGA",
+      "network": "AZ_ASOS",
+      "name": "Page Municipal ASOS",
+      "lat": 36.9261,
+      "lon": -111.4484,
+      "elev_ft": 4316.0,
+      "tier": "canyon",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "RQE",
+      "mos_id": "KRQE",
+      "network": "AZ_ASOS",
+      "name": "Window Rock ASOS",
+      "lat": 35.6519,
+      "lon": -109.0672,
+      "elev_ft": 6742.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "SOW",
+      "mos_id": "KSOW",
+      "network": "AZ_ASOS",
+      "name": "Show Low Regional AWOS",
+      "lat": 34.2655,
+      "lon": -110.0057,
+      "elev_ft": 6415.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "FGZ",
+      "mos_id": "KFLG",
+      "network": "AZ_COOP",
+      "name": "Bellemont WFO Flagstaff COOP",
+      "lat": 35.2300,
+      "lon": -111.8200,
       "elev_ft": 7152.0,
       "tier": "basin_plateau",
       "obs_hour_mst": 7
     },
     {
-      "station_id": "AZ3010",
-      "name": "Flagstaff Area",
-      "lat": 35.1444,
-      "lon": -111.6664,
-      "elev_ft": 7003.0,
-      "tier": "basin_plateau",
-      "obs_hour_mst": 7
-    },
-    {
-      "station_id": "AZ6471",
-      "name": "Phantom Ranch",
+      "station_id": "PHRA3",
+      "mos_id": "KGCN",
+      "network": "AZ_COOP",
+      "name": "Phantom Ranch COOP",
       "lat": 36.1056,
       "lon": -112.0950,
       "elev_ft": 2530.0,
       "tier": "canyon",
-      "obs_hour_mst": 8
-    },
-    {
-      "station_id": "AZ3596",
-      "name": "Grand Canyon NP",
-      "lat": 36.0531,
-      "lon": -112.1472,
-      "elev_ft": 6785.0,
-      "tier": "rim_slope",
-      "obs_hour_mst": 8
-    },
-    {
-      "station_id": "AZ7435",
-      "name": "Saint Johns",
-      "lat": 34.5106,
-      "lon": -109.3653,
-      "elev_ft": 5790.0,
-      "tier": "basin_plateau",
-      "obs_hour_mst": 8
-    },
-    {
-      "station_id": "AZ6796",
-      "name": "Prescott",
-      "lat": 34.5706,
-      "lon": -112.4319,
-      "elev_ft": 5205.0,
-      "tier": "rim_slope",
-      "obs_hour_mst": 7
-    },
-    {
-      "station_id": "AZ9359",
-      "name": "Winslow Area",
-      "lat": 35.0278,
-      "lon": -110.7225,
-      "elev_ft": 4888.0,
-      "tier": "basin_plateau",
-      "obs_hour_mst": 7
-    },
-    {
-      "station_id": "AZ6328",
-      "name": "Payson",
-      "lat": 34.2308,
-      "lon": -111.3392,
-      "elev_ft": 4915.0,
-      "tier": "rim_slope",
-      "obs_hour_mst": 8
-    },
-    {
-      "station_id": "AZ7720",
-      "name": "Show Low City",
-      "lat": 34.2544,
-      "lon": -110.0297,
-      "elev_ft": 6348.0,
-      "tier": "rim_slope",
-      "obs_hour_mst": 8
-    },
-    {
-      "station_id": "AZ8214",
-      "name": "Seligman",
-      "lat": 35.3256,
-      "lon": -112.8778,
-      "elev_ft": 5250.0,
-      "tier": "basin_plateau",
-      "obs_hour_mst": 8
-    },
-    {
-      "station_id": "AZ9439",
-      "name": "Wupatki NM",
-      "lat": 35.5181,
-      "lon": -111.3703,
-      "elev_ft": 4908.0,
-      "tier": "basin_plateau",
       "obs_hour_mst": 8
     }
   ]

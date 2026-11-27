@@ -15,15 +15,14 @@ class TemporalFold:
 
 class FoldScaler:
     """
-    Leakage-safe fold scaler with two critical safeguards:
-      1. Sparse-Archive Channel Guard: Any dynamic channel with < min_valid_samples non-zero
-         observations in train_idx is permanently masked out (mask=0, x=0) across train/val/test
-         so late-starting archives (e.g., HRRR starting Sep 2025) never explode test z-scores.
-      2. COOP Max-Window Phase Selection: Compares bias-adjusted MAE of calendar afternoon vs
-         24-hour morning-reset window per station strictly on train_idx.
+    Leakage-safe fold scaler with:
+      1. Sparse-archive channel guard (< min_valid_samples non-zero training points -> masked 0)
+      2. 3-way Observer Reset Clock Selection per station strictly on train_idx:
+         - Min T candidates: [0: nocturnal_cal, 1: morn24_coop, 2: eve24_coop]
+         - Max T candidates: [3: afternoon_cal, 4: morn24_coop, 5: eve24_coop]
     """
 
-    def __init__(self, min_valid_samples: int = 150, clip_zscore: float = 8.0) -> None:
+    def __init__(self, min_valid_samples: int = 120, clip_zscore: float = 8.0) -> None:
         self.min_valid_samples = min_valid_samples
         self.clip_zscore = clip_zscore
         self.dyn_mean: np.ndarray | None = None
@@ -31,7 +30,8 @@ class FoldScaler:
         self.active_channel_mask: np.ndarray | None = None
         self.ctx_mean: np.ndarray | None = None
         self.ctx_std: np.ndarray | None = None
-        self.station_max_mode: dict[str, int] = {}  # 1 = calendar_afternoon, 2 = coop24_morning_reset
+        self.station_min_mode: dict[str, int] = {}  # 0, 1, or 2
+        self.station_max_mode: dict[str, int] = {}  # 3, 4, or 5
         self.station_anchor_bias: dict[str, np.ndarray] = {}
         self.global_anchor_bias: np.ndarray = np.zeros((5, 2), dtype=np.float32)
 
@@ -49,16 +49,13 @@ class FoldScaler:
         nonzero_counts = ((np.abs(x_dyn) > 1e-6) & (mask_dyn > 0.5)).sum(axis=(0, 1))
 
         safe_denom = np.maximum(valid_counts, 1.0)
-        dyn_sum = (x_dyn * mask_dyn).sum(axis=(0, 1))
-        mean_raw = (dyn_sum / safe_denom).astype(np.float32)
-
+        mean_raw = ((x_dyn * mask_dyn).sum(axis=(0, 1)) / safe_denom).astype(np.float32)
         sq_diff = (((x_dyn - mean_raw[None, None, :]) * mask_dyn) ** 2).sum(axis=(0, 1))
         std_raw = np.sqrt(sq_diff / safe_denom).astype(np.float32)
 
-        # Require both sufficient valid count AND genuine non-zero variance in the training fold
         self.active_channel_mask = (
             (valid_counts >= self.min_valid_samples)
-            & (nonzero_counts >= min(50, self.min_valid_samples // 2))
+            & (nonzero_counts >= min(40, self.min_valid_samples // 2))
             & (std_raw >= 1e-3)
         ).astype(np.float32)
 
@@ -68,28 +65,37 @@ class FoldScaler:
         self.ctx_mean = x_ctx.mean(axis=0).astype(np.float32)
         self.ctx_std = np.maximum(x_ctx.std(axis=0), 0.05).astype(np.float32)
 
-        # Select optimal Max-T COOP window mode per station strictly on training data
         selected_tr = raw_anchor.copy().astype(np.float32)
-        if raw_anchor_candidates is not None:
+        if raw_anchor_candidates is not None and raw_anchor_candidates.shape[-1] == 6:
             for sid in np.unique(station_ids):
                 m = station_ids == sid
+                s_key = str(sid)
+
+                # Best Min window (0=cal, 1=morn24, 2=eve24)
+                y_min_s = y_true[m, :, 0]
+                best_min_idx = 0
+                best_min_mae = float(np.abs((y_min_s - raw_anchor_candidates[m, :, 0]) - np.median(y_min_s - raw_anchor_candidates[m, :, 0])).mean())
+                for cand_i in (1, 2):
+                    err_c = y_min_s - raw_anchor_candidates[m, :, cand_i]
+                    mae_c = float(np.abs(err_c - np.median(err_c)).mean())
+                    if mae_c + 0.08 < best_min_mae:
+                        best_min_mae = mae_c
+                        best_min_idx = cand_i
+                self.station_min_mode[s_key] = best_min_idx
+                selected_tr[m, :, 0] = raw_anchor_candidates[m, :, best_min_idx]
+
+                # Best Max window (3=cal, 4=morn24, 5=eve24)
                 y_max_s = y_true[m, :, 1]
-                cand_cal = raw_anchor_candidates[m, :, 1]
-                cand_c24 = raw_anchor_candidates[m, :, 2]
-
-                err_cal = y_max_s - cand_cal
-                err_c24 = y_max_s - cand_c24
-                mae_cal = float(np.abs(err_cal - np.median(err_cal)).mean())
-                mae_c24 = float(np.abs(err_c24 - np.median(err_c24)).mean())
-
-                # Switch to 24h morning-reset window when it clearly improves training MAE
-                if mae_c24 + 0.10 < mae_cal:
-                    self.station_max_mode[str(sid)] = 2
-                    selected_tr[m, :, 1] = cand_c24
-                else:
-                    self.station_max_mode[str(sid)] = 1
-                    selected_tr[m, :, 1] = cand_cal
-                selected_tr[m, :, 0] = raw_anchor_candidates[m, :, 0]
+                best_max_idx = 3
+                best_max_mae = float(np.abs((y_max_s - raw_anchor_candidates[m, :, 3]) - np.median(y_max_s - raw_anchor_candidates[m, :, 3])).mean())
+                for cand_i in (4, 5):
+                    err_c = y_max_s - raw_anchor_candidates[m, :, cand_i]
+                    mae_c = float(np.abs(err_c - np.median(err_c)).mean())
+                    if mae_c + 0.08 < best_max_mae:
+                        best_max_mae = mae_c
+                        best_max_idx = cand_i
+                self.station_max_mode[s_key] = best_max_idx
+                selected_tr[m, :, 1] = raw_anchor_candidates[m, :, best_max_idx]
 
         err = y_true - selected_tr
         self.global_anchor_bias = np.median(err, axis=0).astype(np.float32)
@@ -129,10 +135,11 @@ class FoldScaler:
         out = raw_anchor.copy().astype(np.float32)
         for i, sid in enumerate(station_ids):
             s_key = str(sid)
-            if raw_anchor_candidates is not None:
-                mode_idx = self.station_max_mode.get(s_key, 1)
-                out[i, :, 0] = raw_anchor_candidates[i, :, 0]
-                out[i, :, 1] = raw_anchor_candidates[i, :, mode_idx]
+            if raw_anchor_candidates is not None and raw_anchor_candidates.shape[-1] == 6:
+                min_i = self.station_min_mode.get(s_key, 0)
+                max_i = self.station_max_mode.get(s_key, 3)
+                out[i, :, 0] = raw_anchor_candidates[i, :, min_i]
+                out[i, :, 1] = raw_anchor_candidates[i, :, max_i]
             bias = self.station_anchor_bias.get(s_key, self.global_anchor_bias)
             out[i] = out[i] + bias
         return out
@@ -140,19 +147,18 @@ class FoldScaler:
 
 def make_purged_expanding_splits(
     issue_dates: np.ndarray,
-    test_days: int = 365,
+    test_days: int = 330,
     val_folds: int = 2,
-    val_fold_days: int = 300,
+    val_fold_days: int = 240,
     purge_days: int = 6,
 ) -> list[TemporalFold]:
     unique_days = np.sort(np.unique(issue_dates))
     total_span_days = int((unique_days[-1] - unique_days[0]) / np.timedelta64(1, "D")) + 1
 
-    # Adapt fold lengths smoothly if archive span is ~2.8 years (e.g., true_lead_nwp 2024-2026)
-    if total_span_days < (test_days + val_folds * val_fold_days + 240):
-        eff_test_days = min(test_days, max(120, int(total_span_days * 0.25)))
-        eff_val_days = min(val_fold_days, max(100, int(total_span_days * 0.18)))
-        eff_folds = 1 if total_span_days < 900 else val_folds
+    if total_span_days < (test_days + val_folds * val_fold_days + 220):
+        eff_test_days = min(test_days, max(90, int(total_span_days * 0.25)))
+        eff_val_days = min(val_fold_days, max(80, int(total_span_days * 0.18)))
+        eff_folds = 1 if total_span_days < 850 else val_folds
     else:
         eff_test_days = test_days
         eff_val_days = val_fold_days
@@ -185,13 +191,11 @@ def make_purged_expanding_splits(
         n_days = len(unique_days)
         t_cut = unique_days[int(n_days * 0.78)]
         v_cut = unique_days[int(n_days * 0.58)]
-        tr_end = v_cut - np.timedelta64(purge_days, "D")
-        va_end = t_cut - np.timedelta64(purge_days, "D")
         folds.append(
             TemporalFold(
                 fold_name="fold_compact",
-                train_idx=np.where(issue_dates < tr_end)[0],
-                val_idx=np.where((issue_dates >= v_cut) & (issue_dates < va_end))[0],
+                train_idx=np.where(issue_dates < (v_cut - np.timedelta64(purge_days, "D")))[0],
+                val_idx=np.where((issue_dates >= v_cut) & (issue_dates < (t_cut - np.timedelta64(purge_days, "D"))))[0],
                 test_idx=np.where(issue_dates >= t_cut)[0],
             )
         )
