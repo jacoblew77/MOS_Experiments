@@ -35,7 +35,7 @@ def fit_predict_ridge_baseline(
         f_ev = np.concatenate([x_dyn_ev[:, d, :], mask_ev[:, d, :], x_ctx_ev], axis=1)
         for target_i in range(2):
             res_tr = y_tr[:, d, target_i] - anchor_tr[:, d, target_i]
-            reg = Ridge(alpha=25.0)
+            reg = Ridge(alpha=50.0)
             reg.fit(f_tr, res_tr)
             preds[:, d, target_i] = anchor_ev[:, d, target_i] + reg.predict(f_ev).astype(np.float32)
     return preds
@@ -45,36 +45,44 @@ def fit_predict_lgbm_baseline(
     x_dyn_tr: np.ndarray,
     mask_tr: np.ndarray,
     x_ctx_tr: np.ndarray,
+    st_idx_tr: np.ndarray,
     anchor_tr: np.ndarray,
     y_tr: np.ndarray,
     x_dyn_va: np.ndarray,
     mask_va: np.ndarray,
     x_ctx_va: np.ndarray,
+    st_idx_va: np.ndarray,
     anchor_va: np.ndarray,
     y_va: np.ndarray,
     x_dyn_ev: np.ndarray,
     mask_ev: np.ndarray,
     x_ctx_ev: np.ndarray,
+    st_idx_ev: np.ndarray,
     anchor_ev: np.ndarray,
     seed: int = 42,
     fold_label: str = "",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fits L1-loss GBDT once per lead day & extremum, returning BOTH (val_preds, eval_preds)."""
     val_preds = np.zeros_like(anchor_va, dtype=np.float32)
     ev_preds = np.zeros_like(anchor_ev, dtype=np.float32)
     t0 = time.monotonic()
 
     for d in range(5):
-        f_tr = np.concatenate([x_dyn_tr[:, d, :], mask_tr[:, d, :], x_ctx_tr, anchor_tr[:, d, :]], axis=1)
-        f_va = np.concatenate([x_dyn_va[:, d, :], mask_va[:, d, :], x_ctx_va, anchor_va[:, d, :]], axis=1)
-        f_ev = np.concatenate([x_dyn_ev[:, d, :], mask_ev[:, d, :], x_ctx_ev, anchor_ev[:, d, :]], axis=1)
+        f_tr = np.concatenate(
+            [x_dyn_tr[:, d, :], mask_tr[:, d, :], x_ctx_tr, st_idx_tr[:, None], anchor_tr[:, d, :]], axis=1
+        )
+        f_va = np.concatenate(
+            [x_dyn_va[:, d, :], mask_va[:, d, :], x_ctx_va, st_idx_va[:, None], anchor_va[:, d, :]], axis=1
+        )
+        f_ev = np.concatenate(
+            [x_dyn_ev[:, d, :], mask_ev[:, d, :], x_ctx_ev, st_idx_ev[:, None], anchor_ev[:, d, :]], axis=1
+        )
         for target_i in range(2):
             res_tr = y_tr[:, d, target_i] - anchor_tr[:, d, target_i]
             res_va = y_va[:, d, target_i] - anchor_va[:, d, target_i]
             gbm = lgb.LGBMRegressor(
                 objective="regression_l1",
-                n_estimators=450,
-                learning_rate=0.04,
+                n_estimators=500,
+                learning_rate=0.035,
                 num_leaves=31,
                 subsample_for_bin=50000,
                 colsample_bytree=0.8,
@@ -94,7 +102,7 @@ def fit_predict_lgbm_baseline(
             ev_preds[:, d, target_i] = anchor_ev[:, d, target_i] + gbm.predict(f_ev).astype(np.float32)
 
         print(
-            f"      [{_ts()}] [LGBM {fold_label}] Day {d + 1}/5 Min+Max trees fitted ({time.monotonic() - t0:.1f}s elapsed)",
+            f"      [{_ts()}] [LGBM {fold_label}] Day {d + 1}/5 Min+Max trees fitted ({time.monotonic() - t0:.1f}s)",
             flush=True,
         )
     return val_preds, ev_preds
@@ -123,17 +131,20 @@ class FGZMultiHorizonResNet(nn.Module):
         self,
         dyn_dim: int,
         ctx_dim: int,
+        num_stations: int = 16,
         hidden_dim: int = 96,
         ctx_embed_dim: int = 32,
-        dropout: float = 0.15,
-        channel_dropout: float = 0.10,
+        station_embed_dim: int = 12,
+        dropout: float = 0.18,
+        channel_dropout: float = 0.12,
     ) -> None:
         super().__init__()
         self.channel_dropout = channel_dropout
         in_per_day = dyn_dim * 2 + 2
 
+        self.station_embed = nn.Embedding(max(num_stations, 2), station_embed_dim)
         self.ctx_encoder = nn.Sequential(
-            nn.Linear(ctx_dim, ctx_embed_dim),
+            nn.Linear(ctx_dim + station_embed_dim, ctx_embed_dim),
             nn.SiLU(),
             nn.Dropout(dropout * 0.5),
             nn.Linear(ctx_embed_dim, ctx_embed_dim),
@@ -179,6 +190,7 @@ class FGZMultiHorizonResNet(nn.Module):
         x_dyn: torch.Tensor,
         mask_dyn: torch.Tensor,
         x_ctx: torch.Tensor,
+        st_idx: torch.Tensor,
         anchor: torch.Tensor,
     ) -> torch.Tensor:
         if self.training and self.channel_dropout > 0.0:
@@ -196,7 +208,8 @@ class FGZMultiHorizonResNet(nn.Module):
         day_ids = torch.arange(5, device=x_dyn.device).unsqueeze(0)
         h = h + self.day_embed(day_ids)
 
-        ctx_emb = self.ctx_encoder(x_ctx)
+        st_emb = self.station_embed(st_idx)
+        ctx_emb = self.ctx_encoder(torch.cat([x_ctx, st_emb], dim=-1))
         gamma = 1.0 + 0.25 * torch.tanh(self.film_gamma(ctx_emb)).unsqueeze(1)
         beta = self.film_beta(ctx_emb).unsqueeze(1)
         h = gamma * h + beta
@@ -242,20 +255,26 @@ def train_and_predict_nn(
     x_dyn_tr: np.ndarray,
     mask_tr: np.ndarray,
     x_ctx_tr: np.ndarray,
+    st_idx_tr: np.ndarray,
     anchor_tr: np.ndarray,
     y_tr: np.ndarray,
     x_dyn_va: np.ndarray,
     mask_va: np.ndarray,
     x_ctx_va: np.ndarray,
+    st_idx_va: np.ndarray,
     anchor_va: np.ndarray,
     y_va: np.ndarray,
     x_dyn_ev: np.ndarray,
     mask_ev: np.ndarray,
     x_ctx_ev: np.ndarray,
+    st_idx_ev: np.ndarray,
     anchor_ev: np.ndarray,
     nn_cfg: dict[str, Any],
+    num_stations: int = 16,
     seed: int = 42,
     fold_label: str = "",
+    pretrained_state_dict: dict[str, Any] | None = None,
+    override_epochs: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, FGZMultiHorizonResNet]:
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -265,24 +284,33 @@ def train_and_predict_nn(
     model = FGZMultiHorizonResNet(
         dyn_dim=x_dyn_tr.shape[2],
         ctx_dim=x_ctx_tr.shape[1],
+        num_stations=num_stations,
         hidden_dim=int(nn_cfg.get("hidden_dim", 96)),
         ctx_embed_dim=int(nn_cfg.get("ctx_embed_dim", 32)),
-        dropout=float(nn_cfg.get("dropout", 0.15)),
-        channel_dropout=float(nn_cfg.get("channel_dropout", 0.10)),
+        station_embed_dim=int(nn_cfg.get("station_embed_dim", 12)),
+        dropout=float(nn_cfg.get("dropout", 0.18)),
+        channel_dropout=float(nn_cfg.get("channel_dropout", 0.12)),
     ).to(device)
+
+    is_finetune = pretrained_state_dict is not None
+    if is_finetune:
+        model.load_state_dict(pretrained_state_dict, strict=False)
+
+    lr = float(nn_cfg.get("finetune_lr", 4e-4)) if is_finetune else float(nn_cfg.get("lr", 1e-3))
+    max_epochs = override_epochs if override_epochs is not None else int(nn_cfg.get("max_epochs", 45))
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(nn_cfg.get("lr", 1.2e-3)),
-        weight_decay=float(nn_cfg.get("weight_decay", 5e-4)),
+        lr=lr,
+        weight_decay=float(nn_cfg.get("weight_decay", 8e-4)),
     )
-    max_epochs = int(nn_cfg.get("max_epochs", 45))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
 
     ds_tr = TensorDataset(
         torch.from_numpy(x_dyn_tr),
         torch.from_numpy(mask_tr),
         torch.from_numpy(x_ctx_tr),
+        torch.from_numpy(st_idx_tr.astype(np.int64)),
         torch.from_numpy(anchor_tr),
         torch.from_numpy(y_tr),
     )
@@ -294,7 +322,7 @@ def train_and_predict_nn(
     )
 
     h_weights = torch.tensor(nn_cfg.get("horizon_weights", [1.0] * 5), dtype=torch.float32, device=device)
-    warmup_epochs = int(nn_cfg.get("warmup_smooth_l1_epochs", 8))
+    warmup_epochs = 0 if is_finetune else int(nn_cfg.get("warmup_smooth_l1_epochs", 6))
     smooth_beta = float(nn_cfg.get("smooth_l1_beta", 2.0))
     patience = int(nn_cfg.get("patience", 8))
     min_w = float(nn_cfg.get("min_weight", 1.0))
@@ -305,6 +333,7 @@ def train_and_predict_nn(
         torch.from_numpy(x_dyn_va).to(device),
         torch.from_numpy(mask_va).to(device),
         torch.from_numpy(x_ctx_va).to(device),
+        torch.from_numpy(st_idx_va.astype(np.int64)).to(device),
         torch.from_numpy(anchor_va).to(device),
     )
     y_va_t = torch.from_numpy(y_va).to(device)
@@ -317,15 +346,16 @@ def train_and_predict_nn(
     for epoch in range(1, max_epochs + 1):
         model.train()
         use_smooth = epoch <= warmup_epochs
-        for bx_dyn, bm_dyn, bx_ctx, b_anc, by in loader_tr:
+        for bx_dyn, bm_dyn, bx_ctx, bs_idx, b_anc, by in loader_tr:
             bx_dyn = bx_dyn.to(device)
             bm_dyn = bm_dyn.to(device)
             bx_ctx = bx_ctx.to(device)
+            bs_idx = bs_idx.to(device)
             b_anc = b_anc.to(device)
             by = by.to(device)
 
             optimizer.zero_grad()
-            pred = model(bx_dyn, bm_dyn, bx_ctx, b_anc)
+            pred = model(bx_dyn, bm_dyn, bx_ctx, bs_idx, b_anc)
             loss = compute_extremum_loss(
                 pred,
                 by,
@@ -370,8 +400,8 @@ def train_and_predict_nn(
 
         if stale_epochs >= patience:
             print(
-                f"      [{_ts()}] [NN {fold_label}] Early stopping triggered at epoch {epoch} "
-                f"(best epoch {best_epoch}: {best_val_mae:.3f}F)",
+                f"      [{_ts()}] [NN {fold_label}] Early stop at ep {epoch} "
+                f"(best ep {best_epoch}: {best_val_mae:.3f}F)",
                 flush=True,
             )
             break
@@ -384,6 +414,7 @@ def train_and_predict_nn(
             torch.from_numpy(x_dyn_ev).to(device),
             torch.from_numpy(mask_ev).to(device),
             torch.from_numpy(x_ctx_ev).to(device),
+            torch.from_numpy(st_idx_ev.astype(np.int64)).to(device),
             torch.from_numpy(anchor_ev).to(device),
         ).cpu().numpy().astype(np.float32)
 

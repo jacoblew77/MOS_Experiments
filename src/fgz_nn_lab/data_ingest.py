@@ -15,6 +15,7 @@ FT_TO_M = 0.3048
 IEM_COOP_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/coop.py"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_HIST_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+OPEN_METEO_PREV_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
 ERA5_HOURLY_VARS = [
     "temperature_2m",
@@ -48,59 +49,40 @@ NWP_ALL_CANONICAL_VARS = [
     "temperature_500hPa",
 ]
 
+PREV_RUNS_BASE_VARS = [
+    "temperature_2m",
+    "dew_point_2m",
+    "precipitation",
+    "cloud_cover",
+    "shortwave_radiation",
+    "wind_speed_10m",
+]
+
+
+def _build_prev_runs_var_list(max_prev_day: int) -> list[str]:
+    out: list[str] = []
+    for base_v in PREV_RUNS_BASE_VARS:
+        out.append(base_v)  # Day 1 (0..24h lead)
+        for k in range(1, max_prev_day + 1):
+            out.append(f"{base_v}_previous_day{k}")
+    return out
+
+
 NWP_MODEL_SPECS: dict[str, dict[str, Any]] = {
     "hrrr": {
         "model_code": "ncep_hrrr_conus",
-        "vars": [
-            "temperature_2m",
-            "dew_point_2m",
-            "precipitation",
-            "snow_depth",
-            "cloud_cover",
-            "cloud_cover_low",
-            "shortwave_radiation",
-            "wind_speed_10m",
-            "wind_gusts_10m",
-            "boundary_layer_height",
-            "temperature_850hPa",
-            "temperature_700hPa",
-            "temperature_500hPa",
-        ],
+        "vars": NWP_ALL_CANONICAL_VARS,
+        "prev_max_day": 1,  # HRRR covers Days 1-2 (day0 + previous_day1)
     },
     "gfs": {
         "model_code": "gfs_seamless",
-        "vars": [
-            "temperature_2m",
-            "dew_point_2m",
-            "precipitation",
-            "snow_depth",
-            "cloud_cover",
-            "cloud_cover_low",
-            "shortwave_radiation",
-            "wind_speed_10m",
-            "wind_gusts_10m",
-            "boundary_layer_height",
-            "temperature_850hPa",
-            "temperature_700hPa",
-            "temperature_500hPa",
-        ],
+        "vars": NWP_ALL_CANONICAL_VARS,
+        "prev_max_day": 4,  # Days 1-5 (day0 + previous_day1..4)
     },
     "ifs": {
         "model_code": "ecmwf_ifs",
-        "vars": [
-            "temperature_2m",
-            "dew_point_2m",
-            "precipitation",
-            "snow_depth",
-            "cloud_cover",
-            "cloud_cover_low",
-            "shortwave_radiation",
-            "wind_speed_10m",
-            "wind_gusts_10m",
-            "temperature_850hPa",
-            "temperature_700hPa",
-            "temperature_500hPa",
-        ],
+        "vars": [v for v in NWP_ALL_CANONICAL_VARS if v != "boundary_layer_height"],
+        "prev_max_day": 4,
     },
 }
 
@@ -173,17 +155,23 @@ def fetch_iem_coop_observations(
     end_date: str,
     raw_dir: Path,
     min_clean_days: int = 365,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns (qc_df, audit_df) where audit_df records raw vs QC-surviving row counts
+    for every requested station so dropped stations are completely transparent.
+    """
     raw_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = raw_dir / f"coop_qc_{start_date}_{end_date}.parquet"
-    if cache_file.exists():
+    cache_file = raw_dir / f"coop_qc_v2_{start_date}_{end_date}_{min_clean_days}d.parquet"
+    audit_file = raw_dir / f"coop_audit_v2_{start_date}_{end_date}_{min_clean_days}d.parquet"
+    if cache_file.exists() and audit_file.exists():
         df_cached = pd.read_parquet(cache_file)
+        audit_cached = pd.read_parquet(audit_file)
         print(
             f"  [{_ts()}] [COOP] Cache HIT -> {cache_file.name} "
-            f"({len(df_cached):,} rows across {df_cached['station_id'].nunique()} stations)",
+            f"({len(df_cached):,} rows across {df_cached['station_id'].nunique()}/{len(stations_df)} stations)",
             flush=True,
         )
-        return df_cached
+        return df_cached, audit_cached
 
     dt_start = pd.Timestamp(start_date)
     dt_end = pd.Timestamp(end_date)
@@ -220,6 +208,7 @@ def fetch_iem_coop_observations(
     ]
     raw_df = pd.read_csv(io.StringIO("\n".join(lines)))
     raw_df.columns = [c.strip().lower() for c in raw_df.columns]
+    raw_df["station_norm"] = raw_df["station"].astype(str).str.strip().str.upper()
 
     qc_df = filter_coop_qc(raw_df)
     qc_df["day"] = pd.to_datetime(qc_df["day"]).dt.tz_localize(None)
@@ -237,19 +226,55 @@ def fetch_iem_coop_observations(
         else:
             qc_df[col] = 0.0
 
-    counts = qc_df.groupby("station_id")["obs_date"].count()
-    valid_sids = counts[counts >= min_clean_days].index.tolist()
+    raw_counts = raw_df.groupby("station_norm")["day"].count().to_dict()
+    qc_counts = qc_df.groupby("station_id")["obs_date"].count().to_dict()
+
+    audit_rows = []
+    for _, st in stations_df.iterrows():
+        sid = st["station_id"]
+        r_cnt = int(raw_counts.get(sid, 0))
+        q_cnt = int(qc_counts.get(sid, 0))
+        kept = q_cnt >= min_clean_days
+        reason = "active_kept" if kept else (
+            "no_iem_rows_in_window" if r_cnt == 0 else f"below_min_clean_days({q_cnt}<{min_clean_days})"
+        )
+        audit_rows.append(
+            {
+                "station_id": sid,
+                "name": st["name"],
+                "elev_ft": float(st["elev_ft"]),
+                "tier": st["tier"],
+                "raw_days": r_cnt,
+                "qc_clean_days": q_cnt,
+                "min_required_days": min_clean_days,
+                "kept": kept,
+                "status_reason": reason,
+            }
+        )
+    audit_df = pd.DataFrame(audit_rows)
+
+    valid_sids = audit_df[audit_df["kept"]]["station_id"].tolist()
     qc_df = qc_df[qc_df["station_id"].isin(valid_sids)].sort_values(
         ["station_id", "obs_date"]
     ).reset_index(drop=True)
 
     qc_df.to_parquet(cache_file, index=False)
+    audit_df.to_parquet(audit_file, index=False)
+
+    dropped = audit_df[~audit_df["kept"]]
     print(
-        f"  [{_ts()}] [COOP] Saved {len(qc_df):,} QC-clean rows across {len(valid_sids)} active stations "
+        f"  [{_ts()}] [COOP] Saved {len(qc_df):,} QC-clean rows across {len(valid_sids)}/{len(stations_df)} stations "
         f"in {time.monotonic() - t0:.1f}s",
         flush=True,
     )
-    return qc_df
+    if not dropped.empty:
+        for _, dr in dropped.iterrows():
+            print(
+                f"    [COOP Audit] Excluded {dr['station_id']} ({dr['name']}): {dr['status_reason']} "
+                f"[raw={dr['raw_days']}, clean={dr['qc_clean_days']}]",
+                flush=True,
+            )
+    return qc_df, audit_df
 
 
 def _request_open_meteo_json(
@@ -326,11 +351,8 @@ def _fetch_batched_multi_station_chunks(
     extra_params: dict[str, Any] | None = None,
     chunk_months: int = 6,
     sleep_sec: float = 0.8,
+    fallback_vars: list[str] | None = None,
 ) -> pd.DataFrame:
-    """
-    Fetches ALL stations simultaneously in a single multi-coordinate Open-Meteo call per time chunk,
-    streaming clear progress updates on every chunk and caching each chunk immediately.
-    """
     chunk_dir.mkdir(parents=True, exist_ok=True)
     windows = _build_date_windows(start_date, end_date, chunk_months)
     total_chunks = len(windows)
@@ -344,11 +366,11 @@ def _fetch_batched_multi_station_chunks(
     src_t0 = time.monotonic()
 
     for idx, (s_str, e_str) in enumerate(windows, start=1):
-        chunk_file = chunk_dir / f"chunk_{src_label}_{s_str}_{e_str}_{len(sids)}st.parquet"
+        chunk_file = chunk_dir / f"chunk_v2_{src_label}_{s_str}_{e_str}_{len(sids)}st.parquet"
 
         if chunk_file.exists():
             print(
-                f"  [{_ts()}] [{src_label.upper():4s} {idx:02d}/{total_chunks:02d}] "
+                f"  [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] "
                 f"Cache HIT  {s_str} -> {e_str}",
                 flush=True,
             )
@@ -356,7 +378,7 @@ def _fetch_batched_multi_station_chunks(
             continue
 
         print(
-            f"  [{_ts()}] [{src_label.upper():4s} {idx:02d}/{total_chunks:02d}] "
+            f"  [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] "
             f"Requesting {s_str} -> {e_str} ({len(sids)} stations batched, {len(requested_vars)} vars)...",
             flush=True,
         )
@@ -378,16 +400,17 @@ def _fetch_batched_multi_station_chunks(
         if extra_params:
             params.update(extra_params)
 
+        fb = fallback_vars or MINIMAL_FALLBACK_VARS
         try:
             payload = _request_open_meteo_json(session, src_label, url, params)
         except requests.HTTPError as err:
-            if err.response is not None and err.response.status_code == 400 and active_vars != MINIMAL_FALLBACK_VARS:
+            if err.response is not None and err.response.status_code == 400 and active_vars != fb:
                 print(
                     f"    [{_ts()}] [{src_label.upper()}] HTTP 400 on full var list for {s_str}..{e_str}; "
-                    f"retrying core vars...",
+                    f"retrying fallback vars...",
                     flush=True,
                 )
-                active_vars = list(MINIMAL_FALLBACK_VARS)
+                active_vars = list(fb)
                 params["hourly"] = ",".join(active_vars)
                 payload = _request_open_meteo_json(session, src_label, url, params)
             else:
@@ -417,7 +440,7 @@ def _fetch_batched_multi_station_chunks(
         dt_chunk = time.monotonic() - t0
         total_elapsed = time.monotonic() - src_t0
         print(
-            f"    [{_ts()}] [{src_label.upper():4s} {idx:02d}/{total_chunks:02d}] "
+            f"    [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] "
             f"Saved {len(chunk_df):,} rows in {dt_chunk:.1f}s (source elapsed: {total_elapsed:.0f}s)",
             flush=True,
         )
@@ -439,23 +462,37 @@ def fetch_hourly_predictors_for_stations(
     raw_dir: Path,
     source_mode: str = "era5",
 ) -> dict[str, pd.DataFrame]:
+    """
+    source_mode options:
+      - 'era5': 10-year ERA5 archive
+      - 'nwp_hybrid': ERA5 + Historical Forecast API (HRRR, GFS, IFS)
+      - 'true_lead_nwp': Historical Forecast Day-0/upper-air + Previous Runs API (_previous_day1..4)
+                         for genuine 24h..120h lead-time decay evaluation.
+    """
     raw_dir.mkdir(parents=True, exist_ok=True)
     chunk_dir = raw_dir / "chunks"
+    pad_start = (pd.Timestamp(start_date) - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
     pad_end = (pd.Timestamp(end_date) + pd.Timedelta(days=6)).strftime("%Y-%m-%d")
 
-    sources_to_pull = ["era5"]
-    if source_mode == "nwp_hybrid":
-        sources_to_pull.extend(["hrrr", "gfs", "ifs"])
+    if source_mode == "era5":
+        sources_to_pull = ["era5"]
+    elif source_mode == "nwp_hybrid":
+        sources_to_pull = ["era5", "hrrr", "gfs", "ifs"]
+    elif source_mode == "true_lead_nwp":
+        sources_to_pull = ["era5", "hrrr", "gfs", "ifs", "prev_hrrr", "prev_gfs", "prev_ifs"]
+    else:
+        raise ValueError(f"Unsupported source_mode: {source_mode}")
 
+    st_hash = "_".join(sorted(stations_df["station_id"].tolist()))
     collected: dict[str, pd.DataFrame] = {}
 
     with requests.Session() as session:
-        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.3"})
+        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.4"})
         for s_i, src in enumerate(sources_to_pull, start=1):
-            src_cache = raw_dir / f"hourly_{src}_{start_date}_{pad_end}_{len(stations_df)}st.parquet"
+            src_cache = raw_dir / f"hourly_v2_{src}_{pad_start}_{pad_end}_{len(stations_df)}st_{abs(hash(st_hash)) % 100000}.parquet"
             print(
                 f"  [{_ts()}] === Source [{s_i}/{len(sources_to_pull)}]: {src.upper()} "
-                f"({start_date} -> {pad_end}) ===",
+                f"({pad_start} -> {pad_end}) ===",
                 flush=True,
             )
             if src_cache.exists():
@@ -473,13 +510,39 @@ def fetch_hourly_predictors_for_stations(
                     src_label="era5",
                     url=OPEN_METEO_ARCHIVE_URL,
                     stations_df=stations_df,
-                    start_date=start_date,
+                    start_date=pad_start,
                     end_date=pad_end,
                     requested_vars=ERA5_HOURLY_VARS,
                     canonical_vars=ERA5_HOURLY_VARS,
                     chunk_dir=chunk_dir,
                     chunk_months=12,
                     sleep_sec=0.6,
+                )
+            elif src.startswith("prev_"):
+                base_mod = src.replace("prev_", "")
+                spec = NWP_MODEL_SPECS[base_mod]
+                prev_vars = _build_prev_runs_var_list(int(spec["prev_max_day"]))
+                fb_prev = [
+                    f"temperature_2m_previous_day{k}" if k > 0 else "temperature_2m"
+                    for k in range(int(spec["prev_max_day"]) + 1)
+                ] + [
+                    f"dew_point_2m_previous_day{k}" if k > 0 else "dew_point_2m"
+                    for k in range(int(spec["prev_max_day"]) + 1)
+                ]
+                full_src_df = _fetch_batched_multi_station_chunks(
+                    session=session,
+                    src_label=src,
+                    url=OPEN_METEO_PREV_RUNS_URL,
+                    stations_df=stations_df,
+                    start_date=pad_start,
+                    end_date=pad_end,
+                    requested_vars=prev_vars,
+                    canonical_vars=prev_vars,
+                    chunk_dir=chunk_dir,
+                    extra_params={"models": spec["model_code"]},
+                    chunk_months=4,
+                    sleep_sec=0.9,
+                    fallback_vars=fb_prev,
                 )
             else:
                 spec = NWP_MODEL_SPECS[src]
@@ -488,7 +551,7 @@ def fetch_hourly_predictors_for_stations(
                     src_label=src,
                     url=OPEN_METEO_HIST_FORECAST_URL,
                     stations_df=stations_df,
-                    start_date=start_date,
+                    start_date=pad_start,
                     end_date=pad_end,
                     requested_vars=spec["vars"],
                     canonical_vars=NWP_ALL_CANONICAL_VARS,

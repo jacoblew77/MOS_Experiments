@@ -17,11 +17,17 @@ on:
       source_mode:
         description: "Predictor archive mode"
         required: true
-        default: "era5"
+        default: "nwp_hybrid"
         type: choice
         options:
           - era5
           - nwp_hybrid
+          - true_lead_nwp
+      pretrain_era5:
+        description: "Include 2-stage ERA5-Pretrained -> NWP-Finetuned NN"
+        required: true
+        default: true
+        type: boolean
       fast_smoke:
         description: "Run fast smoke window (3 stations, 2 years)"
         required: true
@@ -37,7 +43,7 @@ on:
 jobs:
   test-and-train:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -55,31 +61,64 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install -e ".[dev]"
 
-      - name: Run leakage, QC, and alignment unit tests
+      - name: Run leakage, QC, and sparse-scaler unit tests
         run: pytest -v
 
       - name: Restore cached COOP and NWP Parquet extracts
+        id: cache-raw-restore
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: data/raw
-          key: fgz-nn-raw-v1-${{ inputs.source_mode }}-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}
+          key: fgz-nn-raw-v3-${{ inputs.source_mode }}-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-${{ github.run_id }}
           restore-keys: |
-            fgz-nn-raw-v1-${{ inputs.source_mode }}-
+            fgz-nn-raw-v3-${{ inputs.source_mode }}-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-
+            fgz-nn-raw-v3-
+            fgz-nn-raw-v2-
+
+      - name: Snapshot raw file count before run
+        id: pre-count
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p data/raw
+          COUNT=$(find data/raw -type f | wc -l)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Execute experiment pipeline
         if: github.event_name == 'workflow_dispatch'
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          SMOKE_FLAG=""
+          EXTRA_FLAGS=""
           if [ "${{ inputs.fast_smoke }}" = "true" ]; then
-            SMOKE_FLAG="--fast-smoke"
+            EXTRA_FLAGS="$EXTRA_FLAGS --fast-smoke"
+          fi
+          if [ "${{ inputs.pretrain_era5 }}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --pretrain-era5"
           fi
           python scripts/run_pipeline.py \
             --stage "${{ inputs.stage }}" \
             --source-mode "${{ inputs.source_mode }}" \
-            $SMOKE_FLAG
+            $EXTRA_FLAGS
 
-      - name: Print leaderboard to job summary
+      - name: Check for new raw cache files
+        if: always() && github.event_name == 'workflow_dispatch'
+        run: |
+          AFTER_COUNT=$(find data/raw -type f 2>/dev/null | wc -l || echo 0)
+          if [ "$AFTER_COUNT" != "${{ steps.pre-count.outputs.count }}" ]; then
+            echo "NEW_CACHE_FILES=true" >> $GITHUB_ENV
+          else
+            echo "NEW_CACHE_FILES=false" >> $GITHUB_ENV
+          fi
+
+      - name: Persist data/raw to GitHub Actions Cache
+        if: always() && github.event_name == 'workflow_dispatch' && env.NEW_CACHE_FILES == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/raw
+          key: fgz-nn-raw-v3-${{ inputs.source_mode }}-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-${{ github.run_id }}
+
+      - name: Print leaderboard & station audit to job summary
         if: github.event_name == 'workflow_dispatch' && hashFiles('data/runs/leaderboard.csv') != ''
         run: |
           echo "## FGZ COOP 5-Day Min/Max T MAE Leaderboard (°F)" >> $GITHUB_STEP_SUMMARY
@@ -87,10 +126,12 @@ jobs:
           cat data/runs/leaderboard.csv >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload run leaderboard and stratified MAE slices
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload Single-File Drop-In Bundle
+        if: github.event_name == 'workflow_dispatch' && hashFiles('data/runs/master_analysis_bundle.json') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: fgz-nn-metrics-${{ github.run_number }}
-          path: data/runs/
+          name: fgz-master-${{ inputs.source_mode }}-${{ inputs.stage }}-${{ github.run_number }}
+          path: |
+            data/runs/master_analysis_bundle.json
+            data/runs/master_all_tables.csv
           retention-days: 7

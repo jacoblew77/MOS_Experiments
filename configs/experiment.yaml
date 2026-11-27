@@ -5,11 +5,15 @@ dates:
   era5_end: "2026-10-31"
   nwp_start: "2022-01-01"
   nwp_end: "2026-10-31"
-  smoke_start: "2024-01-01"
+  true_lead_start: "2024-01-05"
+  true_lead_end: "2026-10-31"
+  smoke_start: "2024-01-05"
   smoke_end: "2025-12-31"
 
 qc_and_gating:
-  min_clean_obs_days: 730
+  min_clean_obs_days_era5: 730
+  min_clean_obs_days_nwp: 365
+  min_clean_obs_days_lead: 300
   issue_hour_utc: 12         # 12:00Z = 05:00 MST daily forecast cycle
   morning_min_gate_utc: 15   # Hold Today's Morning Min until >= 15:00Z (08:00 MST)
   afternoon_max_gate_utc: 23 # Hold Today's Afternoon Max until >= 23:00Z (16:00 MST)
@@ -17,20 +21,25 @@ qc_and_gating:
 
 splits:
   purge_days: 6              # Prevents 5-day horizon + lag leakage across fold breaks
-  test_days: 365             # Final chronological year held out
+  test_days: 365             # Final chronological year held out (auto-scales on shorter windows)
   val_folds: 2               # Expanding temporal validation folds prior to test split
-  val_fold_days: 365
+  val_fold_days: 300
+  min_valid_channel_samples: 150
+  clip_zscore: 8.0
 
 nn:
   hidden_dim: 96
   ctx_embed_dim: 32
-  dropout: 0.15
-  channel_dropout: 0.10
-  lr: 0.0012
-  weight_decay: 0.0005
+  station_embed_dim: 12
+  dropout: 0.18
+  channel_dropout: 0.12
+  lr: 0.0010
+  finetune_lr: 0.0004
+  weight_decay: 0.0008
   batch_size: 128
   max_epochs: 45
-  warmup_smooth_l1_epochs: 8
+  pretrain_epochs: 30
+  warmup_smooth_l1_epochs: 6
   smooth_l1_beta: 2.0
   patience: 8
   horizon_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
