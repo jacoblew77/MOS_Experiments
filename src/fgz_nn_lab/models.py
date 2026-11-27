@@ -23,11 +23,9 @@ def fit_l1_optimal_blend_weights(
     pred_b_val: np.ndarray,
     y_val: np.ndarray,
 ) -> np.ndarray:
-    """
-    Finds exact L1-optimal convex weight w in [0, 1] per horizon (d=0..4) and extremum (0=Min, 1=Max)
-    strictly on validation predictions so pred_stack = w * pred_a + (1 - w) * pred_b minimizes MAE.
-    """
-    weights = np.zeros((5, 2), dtype=np.float32)
+    weights = np.full((5, 2), 0.5, dtype=np.float32)
+    if len(y_val) == 0:
+        return weights
     grid = np.linspace(0.0, 1.0, 101, dtype=np.float32)
     for d in range(5):
         for t_i in range(2):
@@ -43,6 +41,63 @@ def fit_l1_optimal_blend_weights(
 def apply_blend_weights(pred_a: np.ndarray, pred_b: np.ndarray, weights: np.ndarray) -> np.ndarray:
     w = weights[None, :, :]
     return (w * pred_a + (1.0 - w) * pred_b).astype(np.float32)
+
+
+def fit_network_aware_blend_weights(
+    pred_nn_val: np.ndarray,
+    pred_lgb_val: np.ndarray,
+    y_val: np.ndarray,
+    networks_val: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Fits dedicated (5, 2) L1 stack weights separately for AZ_ASOS vs AZ_COOP on validation folds."""
+    global_w = fit_l1_optimal_blend_weights(pred_nn_val, pred_lgb_val, y_val)
+    out: dict[str, np.ndarray] = {"GLOBAL": global_w}
+    for net in ("AZ_ASOS", "AZ_COOP"):
+        m = networks_val == net
+        if m.sum() >= 40:
+            out[net] = fit_l1_optimal_blend_weights(pred_nn_val[m], pred_lgb_val[m], y_val[m])
+        else:
+            out[net] = global_w.copy()
+    return out
+
+
+def apply_network_aware_blend(
+    pred_nn: np.ndarray,
+    pred_lgb: np.ndarray,
+    networks: np.ndarray,
+    weight_map: dict[str, np.ndarray],
+) -> np.ndarray:
+    out = np.zeros_like(pred_nn, dtype=np.float32)
+    g_w = weight_map.get("GLOBAL", np.full((5, 2), 0.5, dtype=np.float32))
+    for i, net in enumerate(networks):
+        w = weight_map.get(str(net), g_w)
+        out[i] = w * pred_nn[i] + (1.0 - w) * pred_lgb[i]
+    return out
+
+
+def fit_conformal_residual_quantiles(
+    pred_val: np.ndarray,
+    y_val: np.ndarray,
+    networks_val: np.ndarray,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Calibrates empirical P10 & P90 out-of-fold error quantiles (y - pred) per network and lead day."""
+    res_all = y_val - pred_val
+    q_global = {
+        "q10": np.percentile(res_all, 10, axis=0).astype(np.float32),
+        "q90": np.percentile(res_all, 90, axis=0).astype(np.float32),
+    }
+    out: dict[str, dict[str, np.ndarray]] = {"GLOBAL": q_global}
+    for net in ("AZ_ASOS", "AZ_COOP"):
+        m = networks_val == net
+        if m.sum() >= 40:
+            r_n = res_all[m]
+            out[net] = {
+                "q10": np.percentile(r_n, 10, axis=0).astype(np.float32),
+                "q90": np.percentile(r_n, 90, axis=0).astype(np.float32),
+            }
+        else:
+            out[net] = q_global
+    return out
 
 
 def fit_predict_ridge_baseline(
@@ -163,7 +218,7 @@ class FGZMultiHorizonResNet(nn.Module):
         self,
         dyn_dim: int,
         ctx_dim: int,
-        num_stations: int = 24,
+        num_stations: int = 32,
         hidden_dim: int = 96,
         ctx_embed_dim: int = 32,
         station_embed_dim: int = 12,
@@ -300,7 +355,7 @@ def train_and_predict_nn(
     st_idx_ev: np.ndarray,
     anchor_ev: np.ndarray,
     nn_cfg: dict[str, Any],
-    num_stations: int = 24,
+    num_stations: int = 32,
     seed: int = 42,
     fold_label: str = "",
     pretrained_state_dict: dict[str, Any] | None = None,
@@ -357,7 +412,6 @@ def train_and_predict_nn(
     y_va_t = torch.from_numpy(y_va).to(device)
 
     best_val_mae = float("inf")
-    best_epoch = 0
     best_state = copy.deepcopy(model.state_dict())
     stale_epochs = 0
 
@@ -390,7 +444,6 @@ def train_and_predict_nn(
         improved = val_mae < best_val_mae - 1e-4
         if improved:
             best_val_mae = val_mae
-            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             stale_epochs = 0
         else:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import pandas as pd
 import torch
 import yaml
 
+from fgz_nn_lab.dashboard import build_github_pages_site
 from fgz_nn_lab.data_ingest import (
     fetch_hourly_predictors_for_stations,
     fetch_iem_mos_bulletins,
@@ -25,13 +27,15 @@ from fgz_nn_lab.evaluate import (
     write_single_file_master_bundle,
 )
 from fgz_nn_lab.features import (
-    TensorBundle,
+    CANONICAL_DYN_FEATURES,
     build_aligned_tensors,
     build_live_inference_bundle,
 )
 from fgz_nn_lab.models import (
-    apply_blend_weights,
-    fit_l1_optimal_blend_weights,
+    FGZMultiHorizonResNet,
+    apply_network_aware_blend,
+    fit_conformal_residual_quantiles,
+    fit_network_aware_blend_weights,
     fit_predict_lgbm_baseline,
     fit_predict_ridge_baseline,
     predict_lgbm_grid,
@@ -52,18 +56,16 @@ def pretrain_era5_backbone(
     vocab: list[str],
     fast_smoke: bool = False,
 ) -> dict[str, Any]:
-    e_start = cfg["dates"]["smoke_start"] if fast_smoke else cfg["dates"]["era5_start"]
+    e_start = cfg["dates"]["smoke_start"] if fast_smoke else "2021-01-01"
     e_end = cfg["dates"]["smoke_end"] if fast_smoke else cfg["dates"]["era5_end"]
 
-    print(
-        f"    [{_ts()}] [PRETRAIN] Loading 100%-real observations + ERA5 ({e_start}..{e_end}, cutoff < {target_cutoff_date})...",
-        flush=True,
-    )
+    print(f"    [{_ts()}] [PRETRAIN] Loading 100%-real obs + ERA5 ({e_start}..{e_end}, cutoff < {target_cutoff_date})...", flush=True)
     obs_e, _, _ = fetch_unestimated_iem_observations(
         stations_active, e_start, e_end, raw_dir,
-        min_clean_days=120 if fast_smoke else 400,
+        min_clean_days=120 if fast_smoke else 350,
         min_recent_days=50,
-        max_coop=20, max_asos=20,
+        max_coop=30, max_asos=30,
+        check_estimated_txt=False,
     )
     hourly_e = fetch_hourly_predictors_for_stations(stations_active, e_start, e_end, raw_dir, source_mode="era5")
 
@@ -109,18 +111,181 @@ def pretrain_era5_backbone(
     return {k: v.cpu() for k, v in pre_model.state_dict().items()}
 
 
+def generate_live_forecasts_from_checkpoint(
+    ckpt: dict[str, Any],
+    raw_dir: Path,
+    cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    stations_active: pd.DataFrame = ckpt["stations_active"]
+    vocab: list[str] = ckpt["vocab"]
+    sc: FoldScaler = ckpt["scaler"]
+    lgb_m = ckpt["lgb_models"]
+    weight_map: dict[str, np.ndarray] = ckpt["weight_map"]
+    quantiles_map: dict[str, dict[str, np.ndarray]] = ckpt["quantiles_map"]
+    nn_cfg = ckpt["nn_cfg"]
+
+    # Fetch only the last 14 days of real IEM daily.py obs for causal lags (0 Open-Meteo credits!)
+    today_utc = pd.Timestamp(datetime.now(timezone.utc).date())
+    rec_start = (today_utc - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    rec_end = today_utc.strftime("%Y-%m-%d")
+    recent_obs, _, _ = fetch_unestimated_iem_observations(
+        stations_active, rec_start, rec_end, raw_dir / "live_obs_tmp",
+        min_clean_days=0, min_recent_days=0, max_coop=50, max_asos=50, check_estimated_txt=False,
+    )
+
+    live_hourly, live_mos = fetch_live_operational_inputs(stations_active)
+    qg = cfg["qc_and_gating"]
+    live_bundle, fcast_dates = build_live_inference_bundle(
+        stations_active, recent_obs, live_hourly, live_mos, vocab,
+        int(qg["issue_hour_utc"]), int(qg["morning_min_gate_utc"]),
+        int(qg["afternoon_max_gate_utc"]), int(qg["min_causal_lag_hours"]),
+    )
+    if live_bundle is None:
+        return []
+
+    xd_l, mk_l, xc_l = sc.transform_inputs(live_bundle.x_dyn, live_bundle.mask_dyn, live_bundle.x_ctx)
+    anc_l = sc.calibrate_anchor(live_bundle.raw_anchor, live_bundle.station_ids, live_bundle.raw_anchor_candidates)
+
+    nn_model = FGZMultiHorizonResNet(
+        dyn_dim=len(CANONICAL_DYN_FEATURES),
+        ctx_dim=live_bundle.x_ctx.shape[1],
+        num_stations=len(vocab),
+        hidden_dim=int(nn_cfg.get("hidden_dim", 96)),
+        ctx_embed_dim=int(nn_cfg.get("ctx_embed_dim", 32)),
+        station_embed_dim=int(nn_cfg.get("station_embed_dim", 12)),
+        dropout=float(nn_cfg.get("dropout", 0.18)),
+        channel_dropout=float(nn_cfg.get("channel_dropout", 0.12)),
+    )
+    nn_model.load_state_dict(ckpt["nn_state_dict"], strict=True)
+    nn_model.eval()
+
+    with torch.no_grad():
+        p_nn = nn_model(
+            torch.from_numpy(xd_l),
+            torch.from_numpy(mk_l),
+            torch.from_numpy(xc_l),
+            torch.from_numpy(live_bundle.station_indices.astype(np.int64)),
+            torch.from_numpy(anc_l),
+        ).numpy().astype(np.float32)
+
+    p_lgb = predict_lgbm_grid(lgb_m, xd_l, mk_l, xc_l, live_bundle.station_indices, anc_l)
+    p_stk = apply_network_aware_blend(p_nn, p_lgb, live_bundle.networks, weight_map)
+    # Enforce physical non-crossing (Min <= Max)
+    p_stk[:, :, 0] = np.minimum(p_stk[:, :, 0], p_stk[:, :, 1] - 0.5)
+
+    mode_min_lbl = {0: "cal", 1: "morn24", 2: "eve24"}
+    mode_max_lbl = {3: "cal", 4: "morn24", 5: "eve24"}
+    st_meta = stations_active.set_index("station_id").to_dict(orient="index")
+
+    live_records: list[dict[str, Any]] = []
+    for i, sid in enumerate(live_bundle.station_ids):
+        s_str = str(sid)
+        net_s = str(live_bundle.networks[i])
+        meta = st_meta.get(s_str, {})
+        q_net = quantiles_map.get(net_s, quantiles_map["GLOBAL"])
+        q10, q90 = q_net["q10"], q_net["q90"]
+        clock_str = f"{mode_min_lbl.get(sc.station_min_mode.get(s_str, 0))}/{mode_max_lbl.get(sc.station_max_mode.get(s_str, 3))}"
+
+        days_out = []
+        for d_i, dt_s in enumerate(fcast_dates):
+            lo = float(p_stk[i, d_i, 0])
+            hi = float(p_stk[i, d_i, 1])
+            days_out.append(
+                {
+                    "day": d_i + 1,
+                    "date": dt_s,
+                    "tmin_f": round(lo, 1),
+                    "tmin_p10_f": round(lo + float(q10[d_i, 0]), 1),
+                    "tmin_p90_f": round(lo + float(q90[d_i, 0]), 1),
+                    "tmax_f": round(hi, 1),
+                    "tmax_p10_f": round(hi + float(q10[d_i, 1]), 1),
+                    "tmax_p90_f": round(hi + float(q90[d_i, 1]), 1),
+                    "nn_tmin_f": round(float(p_nn[i, d_i, 0]), 1),
+                    "lgbm_tmin_f": round(float(p_lgb[i, d_i, 0]), 1),
+                    "anchor_tmin_f": round(float(anc_l[i, d_i, 0]), 1),
+                    "nn_tmax_f": round(float(p_nn[i, d_i, 1]), 1),
+                    "lgbm_tmax_f": round(float(p_lgb[i, d_i, 1]), 1),
+                    "anchor_tmax_f": round(float(anc_l[i, d_i, 1]), 1),
+                }
+            )
+        live_records.append(
+            {
+                "station_id": s_str,
+                "network": net_s,
+                "name": str(meta.get("name", s_str)),
+                "lat": float(meta.get("lat", 35.14)),
+                "lon": float(meta.get("lon", -111.67)),
+                "elev_ft": float(meta.get("elev_ft", 7000.0)),
+                "tier": str(live_bundle.tiers[i]),
+                "obs_clock": clock_str,
+                "forecasts": days_out,
+            }
+        )
+    return live_records
+
+
 def main() -> None:
     run_t0 = time.monotonic()
-    parser = argparse.ArgumentParser(description="One-Click Operational FGZ COOP + ASOS AI-MOS Suite")
+    parser = argparse.ArgumentParser(description="WFO Flagstaff Operational AI-MOS v4 (Train + Fast Daily Forecast + GitHub Pages)")
+    parser.add_argument(
+        "--mode",
+        choices=["auto", "forecast", "retrain"],
+        default="auto",
+        help="'auto' uses cached checkpoint (<14d old) for ~40s forecast or retrains if absent; 'forecast' forces fast forecast if checkpoint exists; 'retrain' forces full benchmark training.",
+    )
     parser.add_argument("--fast-smoke", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.yaml"))
     parser.add_argument("--stations", type=Path, default=Path("configs/stations_fgz_coop.json"))
+    parser.add_argument("--site-dir", type=Path, default=Path("site"))
     args = parser.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    st_cfg = json.loads(args.stations.read_text(encoding="utf-8")) if False else yaml.safe_load(args.stations.read_text(encoding="utf-8"))
+    st_cfg = yaml.safe_load(args.stations.read_text(encoding="utf-8"))
     raw_dir = Path("data/raw")
     runs_dir = Path("data/runs")
+    models_dir = Path("data/models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = models_dir / "fgz_op_v4_checkpoint.pkl"
+
+    # Check if we can execute Fast 40-Second Daily Forecast Mode (~106 API credits!)
+    use_fast_ckpt = False
+    if ckpt_path.exists() and args.mode in ("auto", "forecast") and not args.fast_smoke:
+        ckpt_obj = pickle.loads(ckpt_path.read_bytes())
+        trained_dt = pd.Timestamp(ckpt_obj.get("trained_at_utc", "2000-01-01T00:00:00Z"))
+        age_days = (pd.Timestamp(datetime.now(timezone.utc)) - trained_dt).total_seconds() / 86400.0
+        expected_n = int(st_cfg.get("max_asos_stations", 12)) + int(st_cfg.get("max_coop_stations", 14))
+        if args.mode == "forecast" or (age_days <= 14.0 and len(ckpt_obj.get("vocab", [])) == expected_n):
+            use_fast_ckpt = True
+
+    if use_fast_ckpt:
+        print(f"\n[{_ts()}] >>> [FAST DAILY FORECAST MODE] Loaded cached checkpoint ({ckpt_path.name}) — ~106 API credits! <<<", flush=True)
+        ckpt_obj = pickle.loads(ckpt_path.read_bytes())
+        live_records = generate_live_forecasts_from_checkpoint(ckpt_obj, raw_dir, cfg)
+        site_index = build_github_pages_site(
+            site_dir=args.site_dir,
+            stations_df=ckpt_obj["stations_active"],
+            live_forecasts=live_records,
+            leaderboard_rows=ckpt_obj.get("leaderboard_rows", []),
+            station_mae_map=ckpt_obj.get("station_mae_map", {}),
+            run_mode="fast_daily_checkpoint_v4",
+        )
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        if ckpt_obj.get("leaderboard_rows"):
+            pd.DataFrame(ckpt_obj["leaderboard_rows"]).to_csv(runs_dir / "leaderboard.csv", index=False)
+        master_json = write_single_file_master_bundle(
+            runs_dir=runs_dir,
+            source_mode="operational_v4_fast_daily",
+            coop_audit_df=ckpt_obj.get("audit_df", pd.DataFrame()),
+            channel_coverage_df=ckpt_obj.get("cov_df", pd.DataFrame()),
+            live_forecasts=live_records,
+        )
+        print(
+            f"\n[{_ts()}] >>> FAST DAILY FORECAST COMPLETE in {time.monotonic() - run_t0:.1f}s <<<\n"
+            f"  GitHub Pages Portal : {site_index}\n"
+            f"  Single Master JSON  : {master_json}",
+            flush=True,
+        )
+        return
 
     candidates_df = load_station_catalog(args.stations, raw_dir=None if args.fast_smoke else raw_dir)
     qg = cfg["qc_and_gating"]
@@ -140,18 +305,18 @@ def main() -> None:
         candidates_df, start_date, end_date, raw_dir,
         min_clean_days=min_clean,
         min_recent_days=min_recent,
-        max_coop=int(st_cfg.get("max_coop_stations", 12)),
-        max_asos=int(st_cfg.get("max_asos_stations", 8)),
+        max_coop=int(st_cfg.get("max_coop_stations", 14)),
+        max_asos=int(st_cfg.get("max_asos_stations", 12)),
     )
     vocab = sorted(stations_active["station_id"].tolist())
 
-    print(f"\n[{_ts()}] >>> [2/5] INGESTING OPERATIONAL NWP, 2.5KM NBM GRIDDED MOS & IEM MOS BULLETINS <<<", flush=True)
+    print(f"\n[{_ts()}] >>> [2/5] INGESTING INCREMENTAL DELTA NWP, 2.5KM NBM & D1-5 GFS+MEX MOS <<<", flush=True)
     mos_df = fetch_iem_mos_bulletins(stations_active, start_date, end_date, raw_dir)
     hourly_by_src = fetch_hourly_predictors_for_stations(
         stations_active, start_date, end_date, raw_dir, source_mode="true_lead_nwp"
     )
 
-    print(f"\n[{_ts()}] >>> [3/5] ALIGNING 5-DAY MULTI-MODEL & MOS TENSORS <<<", flush=True)
+    print(f"\n[{_ts()}] >>> [3/5] ALIGNING 5-DAY MULTI-MODEL & EXTENDED MOS TENSORS <<<", flush=True)
     bundle = build_aligned_tensors(
         stations_df=stations_active,
         coop_df=obs_df,
@@ -184,16 +349,16 @@ def main() -> None:
         purge_days=int(sp["purge_days"]),
     )
 
-    print(f"\n[{_ts()}] >>> [4/5] TRAINING BASELINES, ERA5-PRETRAINED NN & OPERATIONAL NN+LGBM STACK <<<", flush=True)
+    print(f"\n[{_ts()}] >>> [4/5] TRAINING MODELS, NETWORK-AWARE (ASOS/COOP) STACK & CONFORMAL P10-P90 <<<", flush=True)
     test_idx = folds[-1].test_idx
     n_folds = len(folds)
 
-    preds_val_by_mod: dict[str, list[np.ndarray]] = {k: [] for k in ("anchor", "ridge", "lgbm", "nn_scratch", "nn_era5_pretrained", "nn_lgbm_stack")}
-    preds_test_ens: dict[str, np.ndarray] = {k: np.zeros((len(test_idx), 5, 2), dtype=np.float32) for k in preds_val_by_mod}
+    mod_keys = ("anchor", "ridge", "lgbm", "nn_scratch", "nn_era5_pretrained", "nn_lgbm_net_stack")
+    preds_val_by_mod: dict[str, list[np.ndarray]] = {k: [] for k in mod_keys}
+    preds_test_ens: dict[str, np.ndarray] = {k: np.zeros((len(test_idx), 5, 2), dtype=np.float32) for k in mod_keys}
     val_y_all, val_sid_all, val_tier_all, val_snow_all, val_net_all = [], [], [], [], []
     fold_diag: dict[str, Any] = {}
-
-    last_fold_artifacts: dict[str, Any] = {}
+    last_ckpt_parts: dict[str, Any] = {}
 
     for f_i, fold in enumerate(folds, start=1):
         tr, va, te = fold.train_idx, fold.val_idx, fold.test_idx
@@ -221,12 +386,10 @@ def main() -> None:
         anc_va = scaler.calibrate_anchor(bundle.raw_anchor[va], bundle.station_ids[va], bundle.raw_anchor_candidates[va])
         anc_te = scaler.calibrate_anchor(bundle.raw_anchor[te], bundle.station_ids[te], bundle.raw_anchor_candidates[te])
 
-        # 1. Anchor & Ridge
         vp_anc, tp_anc = anc_va, anc_te
         vp_rid = fit_predict_ridge_baseline(xd_tr, mk_tr, xc_tr, anc_tr, bundle.y_true[tr], xd_va, mk_va, xc_va, anc_va)
         tp_rid = fit_predict_ridge_baseline(xd_tr, mk_tr, xc_tr, anc_tr, bundle.y_true[tr], xd_te, mk_te, xc_te, anc_te)
 
-        # 2. LightGBM
         vp_lgb, tp_lgb, lgb_models = fit_predict_lgbm_baseline(
             xd_tr, mk_tr, xc_tr, bundle.station_indices[tr], anc_tr, bundle.y_true[tr],
             xd_va, mk_va, xc_va, bundle.station_indices[va], anc_va, bundle.y_true[va],
@@ -234,7 +397,6 @@ def main() -> None:
             seed=int(cfg["seed"]), fold_label=fold.fold_name,
         )
 
-        # 3. Scratch NN
         vp_nns, tp_nns, _ = train_and_predict_nn(
             xd_tr, mk_tr, xc_tr, bundle.station_indices[tr], anc_tr, bundle.y_true[tr],
             xd_va, mk_va, xc_va, bundle.station_indices[va], anc_va, bundle.y_true[va],
@@ -243,7 +405,6 @@ def main() -> None:
             fold_label=f"{fold.fold_name}_scratch",
         )
 
-        # 4. Two-stage ERA5-Pretrained -> NWP+NBM+MOS Fine-Tuned NN
         pre_state = pretrain_era5_backbone(
             stations_active=stations_active, raw_dir=raw_dir, cfg=cfg,
             target_cutoff_date=bundle.issue_dates[va[0]], vocab=vocab, fast_smoke=args.fast_smoke,
@@ -256,10 +417,11 @@ def main() -> None:
             fold_label=f"{fold.fold_name}_era5_xfer", pretrained_state_dict=pre_state if pre_state else None,
         )
 
-        # 5. Out-of-Fold Validation-Optimal L1 Stack (ERA5-Pretrained NN + LightGBM)
-        blend_w = fit_l1_optimal_blend_weights(vp_nnx, vp_lgb, bundle.y_true[va])
-        vp_stk = apply_blend_weights(vp_nnx, vp_lgb, blend_w)
-        tp_stk = apply_blend_weights(tp_nnx, tp_lgb, blend_w)
+        # Network-Aware (AZ_ASOS vs AZ_COOP) L1 Stack + Conformal P10-P90 Quantiles
+        net_weights = fit_network_aware_blend_weights(vp_nnx, vp_lgb, bundle.y_true[va], bundle.networks[va])
+        vp_stk = apply_network_aware_blend(vp_nnx, vp_lgb, bundle.networks[va], net_weights)
+        tp_stk = apply_network_aware_blend(tp_nnx, tp_lgb, bundle.networks[te], net_weights)
+        q_map = fit_conformal_residual_quantiles(vp_stk, bundle.y_true[va], bundle.networks[va])
 
         mode_names_min = {0: "cal", 1: "morn24", 2: "eve24"}
         mode_names_max = {3: "cal", 4: "morn24", 5: "eve24"}
@@ -270,8 +432,10 @@ def main() -> None:
                 s: f"min={mode_names_min.get(scaler.station_min_mode.get(s, 0))},max={mode_names_max.get(scaler.station_max_mode.get(s, 3))}"
                 for s in sorted(np.unique(bundle.station_ids[tr]))
             },
-            "nn_weight_in_stack_min_d1_5": [round(float(x), 2) for x in blend_w[:, 0]],
-            "nn_weight_in_stack_max_d1_5": [round(float(x), 2) for x in blend_w[:, 1]],
+            "nn_weight_asos_min_d1_5": [round(float(x), 2) for x in net_weights["AZ_ASOS"][:, 0]],
+            "nn_weight_coop_min_d1_5": [round(float(x), 2) for x in net_weights["AZ_COOP"][:, 0]],
+            "nn_weight_asos_max_d1_5": [round(float(x), 2) for x in net_weights["AZ_ASOS"][:, 1]],
+            "nn_weight_coop_max_d1_5": [round(float(x), 2) for x in net_weights["AZ_COOP"][:, 1]],
         }
 
         for m_key, vp_arr, tp_arr in [
@@ -280,7 +444,7 @@ def main() -> None:
             ("lgbm", vp_lgb, tp_lgb),
             ("nn_scratch", vp_nns, tp_nns),
             ("nn_era5_pretrained", vp_nnx, tp_nnx),
-            ("nn_lgbm_stack", vp_stk, tp_stk),
+            ("nn_lgbm_net_stack", vp_stk, tp_stk),
         ]:
             preds_val_by_mod[m_key].append(vp_arr)
             preds_test_ens[m_key] += tp_arr / n_folds
@@ -291,11 +455,18 @@ def main() -> None:
         val_snow_all.append(bundle.snow_flag[va])
         val_net_all.append(bundle.networks[va])
 
-        last_fold_artifacts = {
+        last_ckpt_parts = {
+            "trained_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "stations_active": stations_active,
+            "vocab": vocab,
             "scaler": scaler,
-            "nn_model": nnx_model,
+            "nn_state_dict": {k: v.cpu() for k, v in nnx_model.state_dict().items()},
+            "nn_cfg": cfg["nn"],
             "lgb_models": lgb_models,
-            "blend_w": blend_w,
+            "weight_map": net_weights,
+            "quantiles_map": q_map,
+            "audit_df": audit_df,
+            "cov_df": cov_df,
         }
 
     vy_cat = np.concatenate(val_y_all, axis=0)
@@ -304,8 +475,9 @@ def main() -> None:
     vsnow_cat = np.concatenate(val_snow_all, axis=0)
     vnet_cat = np.concatenate(val_net_all, axis=0)
 
-    print(f"\n[{_ts()}] >>> OPERATIONAL SUITE TEST LEADERBOARD (100% REAL OBS, TRUE 24h..120h LEAD) <<<", flush=True)
-    for m_key in ("anchor", "ridge", "lgbm", "nn_scratch", "nn_era5_pretrained", "nn_lgbm_stack"):
+    station_mae_map: dict[str, dict[str, float]] = {}
+    print(f"\n[{_ts()}] >>> OPERATIONAL v4 TEST LEADERBOARD (26 FGZ SITES, 0% ESTIMATED OBS) <<<", flush=True)
+    for m_key in mod_keys:
         v_sum, _ = compute_metrics_bundle(
             np.concatenate(preds_val_by_mod[m_key], axis=0), vy_cat, vsid_cat, vtier_cat, vsnow_cat, vnet_cat
         )
@@ -314,81 +486,59 @@ def main() -> None:
             bundle.tiers[test_idx], bundle.snow_flag[test_idx], bundle.networks[test_idx],
         )
         log_experiment_run(
-            runs_dir, run_id=f"op_v3_{m_key}", model_family=m_key,
-            feature_tag="nbm_mos_upper_real_obs", val_summary=v_sum, test_summary=t_sum,
+            runs_dir, run_id=f"op_v4_{m_key}", model_family=m_key,
+            feature_tag="nbm_mex_mos_netstack_v4", val_summary=v_sum, test_summary=t_sum,
             stratified_df=t_strat, config_snapshot=cfg, fold_diagnostics=fold_diag,
         )
+        if m_key == "nn_lgbm_net_stack":
+            for _, sr in t_strat[t_strat["slice_type"] == "station"].iterrows():
+                station_mae_map[str(sr["slice_name"])] = {
+                    "mae_min": float(sr["mae_min"]),
+                    "mae_max": float(sr["mae_max"]),
+                }
         print(
-            f"  {m_key.upper():20s} | Test Min MAE: {t_sum['mae_min_1_5']:.3f}F | "
+            f"  {m_key.upper():22s} | Test Min MAE: {t_sum['mae_min_1_5']:.3f}F | "
             f"Test Max MAE: {t_sum['mae_max_1_5']:.3f}F | Combined: {t_sum['mae_all_1_5']:.3f}F",
             flush=True,
         )
 
-    print(f"\n[{_ts()}] >>> [5/5] GENERATING LIVE 5-DAY OPERATIONAL FORECAST FOR FGZ STATIONS <<<", flush=True)
+    lb_rows = pd.read_csv(runs_dir / "leaderboard.csv").to_dict(orient="records")
+    last_ckpt_parts["leaderboard_rows"] = lb_rows
+    last_ckpt_parts["station_mae_map"] = station_mae_map
+
+    if not args.fast_smoke:
+        ckpt_path.write_bytes(pickle.dumps(last_ckpt_parts))
+        print(f"  [{_ts()}] Saved production checkpoint -> {ckpt_path} (future daily runs take ~40s!)", flush=True)
+
+    print(f"\n[{_ts()}] >>> [5/5] GENERATING LIVE 5-DAY FORECAST & INTERACTIVE GITHUB PAGES PORTAL <<<", flush=True)
     live_records: list[dict[str, Any]] = []
     try:
-        live_hourly, live_mos = fetch_live_operational_inputs(stations_active)
-        live_bundle, fcast_dates = build_live_inference_bundle(
-            stations_active, obs_df, live_hourly, live_mos, vocab,
-            int(qg["issue_hour_utc"]), int(qg["morning_min_gate_utc"]),
-            int(qg["afternoon_max_gate_utc"]), int(qg["min_causal_lag_hours"]),
-        )
-        if live_bundle is not None and last_fold_artifacts:
-            sc: FoldScaler = last_fold_artifacts["scaler"]
-            nn_m = last_fold_artifacts["nn_model"]
-            lgb_m = last_fold_artifacts["lgb_models"]
-            bw = last_fold_artifacts["blend_w"]
-
-            xd_l, mk_l, xc_l = sc.transform_inputs(live_bundle.x_dyn, live_bundle.mask_dyn, live_bundle.x_ctx)
-            anc_l = sc.calibrate_anchor(live_bundle.raw_anchor, live_bundle.station_ids, live_bundle.raw_anchor_candidates)
-
-            device = next(nn_m.parameters()).device
-            nn_m.eval()
-            with torch.no_grad():
-                p_nn = nn_m(
-                    torch.from_numpy(xd_l).to(device),
-                    torch.from_numpy(mk_l).to(device),
-                    torch.from_numpy(xc_l).to(device),
-                    torch.from_numpy(live_bundle.station_indices.astype(np.int64)).to(device),
-                    torch.from_numpy(anc_l).to(device),
-                ).cpu().numpy().astype(np.float32)
-            p_lgb = predict_lgbm_grid(lgb_m, xd_l, mk_l, xc_l, live_bundle.station_indices, anc_l)
-            p_stk = apply_blend_weights(p_nn, p_lgb, bw)
-
-            st_name_map = stations_active.set_index("station_id")["name"].to_dict()
-            for i, sid in enumerate(live_bundle.station_ids):
-                days_out = []
-                for d_i, dt_s in enumerate(fcast_dates):
-                    days_out.append(
-                        {
-                            "day": d_i + 1,
-                            "date": dt_s,
-                            "tmin_f": round(float(p_stk[i, d_i, 0]), 1),
-                            "tmax_f": round(float(p_stk[i, d_i, 1]), 1),
-                            "nn_tmin_f": round(float(p_nn[i, d_i, 0]), 1),
-                            "lgbm_tmin_f": round(float(p_lgb[i, d_i, 0]), 1),
-                        }
-                    )
-                live_records.append(
-                    {
-                        "station_id": str(sid),
-                        "network": str(live_bundle.networks[i]),
-                        "name": st_name_map.get(str(sid), str(sid)),
-                        "forecasts": days_out,
-                    }
-                )
-            print(f"  [{_ts()}] Generated live 5-day forecasts for {len(live_records)} FGZ stations!", flush=True)
+        live_records = generate_live_forecasts_from_checkpoint(last_ckpt_parts, raw_dir, cfg)
+        print(f"  [{_ts()}] Generated live 5-day forecasts + P10-P90 intervals for {len(live_records)} FGZ stations!", flush=True)
     except Exception as exc:
         print(f"  [{_ts()}] Live forecast step skipped ({type(exc).__name__}: {exc})", flush=True)
 
+    site_index = build_github_pages_site(
+        site_dir=args.site_dir,
+        stations_df=stations_active,
+        live_forecasts=live_records,
+        leaderboard_rows=lb_rows,
+        station_mae_map=station_mae_map,
+        run_mode="full_train_and_forecast_v4",
+    )
     master_json = write_single_file_master_bundle(
         runs_dir=runs_dir,
-        source_mode="operational_v3_suite",
+        source_mode="operational_v4_suite",
         coop_audit_df=audit_df,
         channel_coverage_df=cov_df,
         live_forecasts=live_records,
     )
-    print(f"\n[{_ts()}] >>> ALL DONE in {time.monotonic() - run_t0:.1f}s | Single Drop-In File: {master_json} <<<", flush=True)
+    print(
+        f"\n[{_ts()}] >>> ALL DONE in {time.monotonic() - run_t0:.1f}s <<<\n"
+        f"  GitHub Pages Portal : {site_index}\n"
+        f"  Single Master JSON  : {master_json}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

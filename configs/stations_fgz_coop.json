@@ -1,8 +1,8 @@
 {
-  "_notes": "Seed & override catalog for WFO Flagstaff (FGZ) AZ_COOP + AZ_ASOS auto-discovery. Phantom Ranch (PHRA3) locked to 2530 ft.",
+  "_notes": "WFO Flagstaff (FGZ) AZ_COOP + AZ_ASOS Operational Roster (26 stations: 12 ASOS + 14 COOP). Phantom Ranch locked to 2530 ft.",
   "auto_discover_fgz": true,
-  "max_coop_stations": 12,
-  "max_asos_stations": 8,
+  "max_coop_stations": 14,
+  "max_asos_stations": 12,
   "elevation_overrides_ft": {
     "PHRA3": 2530.0,
     "AZ6471": 2530.0
@@ -100,6 +100,50 @@
       "obs_hour_mst": 0
     },
     {
+      "station_id": "PAN",
+      "mos_id": "KPAN",
+      "network": "AZ_ASOS",
+      "name": "Payson AWOS",
+      "lat": 34.2568,
+      "lon": -111.3392,
+      "elev_ft": 5157.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "SEZ",
+      "mos_id": "KSEZ",
+      "network": "AZ_ASOS",
+      "name": "Sedona AWOS",
+      "lat": 34.8486,
+      "lon": -111.7885,
+      "elev_ft": 4829.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "CMR",
+      "mos_id": "KCMR",
+      "network": "AZ_ASOS",
+      "name": "Williams Clark Memorial AWOS",
+      "lat": 35.3036,
+      "lon": -112.1939,
+      "elev_ft": 6680.0,
+      "tier": "basin_plateau",
+      "obs_hour_mst": 0
+    },
+    {
+      "station_id": "P52",
+      "mos_id": "KPRC",
+      "network": "AZ_ASOS",
+      "name": "Cottonwood AWOS",
+      "lat": 34.7300,
+      "lon": -112.0350,
+      "elev_ft": 3540.0,
+      "tier": "canyon",
+      "obs_hour_mst": 0
+    },
+    {
       "station_id": "FGZ",
       "mos_id": "KFLG",
       "network": "AZ_COOP",
@@ -108,7 +152,7 @@
       "lon": -111.8200,
       "elev_ft": 7152.0,
       "tier": "basin_plateau",
-      "obs_hour_mst": 7
+      "obs_hour_mst": 17
     },
     {
       "station_id": "PHRA3",
@@ -119,7 +163,29 @@
       "lon": -112.0950,
       "elev_ft": 2530.0,
       "tier": "canyon",
-      "obs_hour_mst": 8
+      "obs_hour_mst": 18
+    },
+    {
+      "station_id": "ALPA3",
+      "mos_id": "KSJN",
+      "network": "AZ_COOP",
+      "name": "Alpine COOP",
+      "lat": 33.8481,
+      "lon": -109.1431,
+      "elev_ft": 7999.0,
+      "tier": "rim_slope",
+      "obs_hour_mst": 16
+    },
+    {
+      "station_id": "CHNA3",
+      "mos_id": "KRQE",
+      "network": "AZ_COOP",
+      "name": "Canyon de Chelly COOP",
+      "lat": 36.1539,
+      "lon": -109.5397,
+      "elev_ft": 5545.0,
+      "tier": "canyon",
+      "obs_hour_mst": 17
     }
   ]
 }

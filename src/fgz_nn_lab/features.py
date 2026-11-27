@@ -115,19 +115,19 @@ def _ts() -> str:
 
 @dataclass
 class TensorBundle:
-    issue_dates: np.ndarray            # (N,) datetime64[D]
-    station_ids: np.ndarray            # (N,) str
-    networks: np.ndarray               # (N,) str ('AZ_ASOS' or 'AZ_COOP')
-    station_indices: np.ndarray        # (N,) int64
+    issue_dates: np.ndarray
+    station_ids: np.ndarray
+    networks: np.ndarray
+    station_indices: np.ndarray
     station_vocab: list[str]
-    tiers: np.ndarray                  # (N,) str
-    x_dyn: np.ndarray                  # (N, 5, C_dyn) float32
-    mask_dyn: np.ndarray               # (N, 5, C_dyn) float32
-    x_ctx: np.ndarray                  # (N, C_ctx) float32
-    raw_anchor: np.ndarray             # (N, 5, 2) float32
-    raw_anchor_candidates: np.ndarray  # (N, 5, 6) float32 [min_cal, min_morn24, min_eve24, max_cal, max_morn24, max_eve24]
-    y_true: np.ndarray                 # (N, 5, 2) float32
-    snow_flag: np.ndarray              # (N, 5) bool
+    tiers: np.ndarray
+    x_dyn: np.ndarray
+    mask_dyn: np.ndarray
+    x_ctx: np.ndarray
+    raw_anchor: np.ndarray
+    raw_anchor_candidates: np.ndarray
+    y_true: np.ndarray
+    snow_flag: np.ndarray
     dyn_feature_names: list[str]
     ctx_feature_names: list[str]
 
@@ -137,12 +137,6 @@ def _aggregate_station_windows(
     stations_df: pd.DataFrame,
     label: str,
 ) -> pd.DataFrame:
-    """
-    Aggregates sub-daily hourly NWP/reanalysis steps into 3 observer reset conventions:
-      1. Calendar/ASOS window: Nocturnal Min (00..09 MST) & Afternoon Max (10..18 MST) on D
-      2. Morning COOP 24h reset ([07:00 MST D-1 .. 07:00 MST D])
-      3. Evening COOP 24h reset ([17:00 MST D-1 .. 17:00 MST D])
-    """
     t0 = time.monotonic()
     obs_hr_map = stations_df.set_index("station_id")["obs_hour_mst"].to_dict()
 
@@ -153,11 +147,8 @@ def _aggregate_station_windows(
 
     st_obs_hr = df["station_id"].map(obs_hr_map).fillna(7).astype(int)
     morn_hr = np.where((st_obs_hr >= 5) & (st_obs_hr <= 10), st_obs_hr, 7)
-    morn_shifted = local_time + pd.to_timedelta(24 - morn_hr, unit="h")
-    df["morn24_date"] = morn_shifted.dt.floor("D")
-
-    eve_shifted = local_time + pd.Timedelta(hours=7)  # [17:00 D-1 .. 16:59 D] -> D
-    df["eve24_date"] = eve_shifted.dt.floor("D")
+    df["morn24_date"] = (local_time + pd.to_timedelta(24 - morn_hr, unit="h")).dt.floor("D")
+    df["eve24_date"] = (local_time + pd.Timedelta(hours=7)).dt.floor("D")
 
     for col in [
         "dew_point_2m", "precipitation", "snow_depth", "cloud_cover",
@@ -232,10 +223,7 @@ def _aggregate_station_windows(
     merged = pd.merge(merged, g_morn, on=["station_id", "target_date"], how="left")
     merged = pd.merge(merged, g_eve, on=["station_id", "target_date"], how="left")
 
-    print(
-        f"  [{_ts()}] [windows] Aggregated {label:12s} -> {len(merged):,} station-days in {time.monotonic() - t0:.1f}s",
-        flush=True,
-    )
+    print(f"  [{_ts()}] [windows] Aggregated {label:12s} -> {len(merged):,} station-days in {time.monotonic() - t0:.1f}s", flush=True)
     return merged
 
 
@@ -380,6 +368,8 @@ def build_aligned_tensors(
     gfs_hist_daily = _aggregate_station_windows(hourly_by_source["gfs_hist"], st_df, "GFS_HIST") if "gfs_hist" in hourly_by_source else (
         _aggregate_station_windows(hourly_by_source["gfs"], st_df, "GFS") if "gfs" in hourly_by_source else None
     )
+    ifs_direct = _aggregate_station_windows(hourly_by_source["ifs"], st_df, "IFS") if "ifs" in hourly_by_source else None
+    nbm_direct = _aggregate_station_windows(hourly_by_source["nbm"], st_df, "NBM") if "nbm" in hourly_by_source else None
     hrrr_hist_daily = _aggregate_station_windows(hourly_by_source["hrrr"], st_df, "HRRR") if "hrrr" in hourly_by_source else None
 
     lead_tables: list[pd.DataFrame] = []
@@ -414,7 +404,7 @@ def build_aligned_tensors(
     else:
         prim_base = gfs_hist_daily if gfs_hist_daily is not None else era5_daily
         assert prim_base is not None
-        shared_tbl = _merge_canonical_day_table(prim_base, era5_daily, None, None, hrrr_hist_daily)
+        shared_tbl = _merge_canonical_day_table(prim_base, era5_daily, ifs_direct, nbm_direct, hrrr_hist_daily)
         lead_tables = [shared_tbl for _ in range(5)]
 
     table_cols = PRIMARY_SLOTS + IFS_SLOTS + NBM_SLOTS + HRRR_SLOTS + [
@@ -472,7 +462,6 @@ def build_aligned_tensors(
 
     ix_h_min = table_cols.index("hrrr_t2m_min_win")
     ix_h_max_cal = table_cols.index("hrrr_t2m_max_cal")
-    ix_h_max_m24 = table_cols.index("hrrr_t2m_max_morn24")
 
     issue_dates_out, sids_out, nets_out, sidx_out, tiers_out = [], [], [], [], []
     x_dyn_list, mask_dyn_list, x_ctx_list = [], [], []
@@ -564,7 +553,6 @@ def build_aligned_tensors(
                 if d_idx >= 2 and hrrr_col_indices:
                     dyn_sample[d_idx, hrrr_col_indices] = np.nan
 
-                # Compute 6 physical anchor candidates: [min_cal, min_m24, min_e24, max_cal, max_m24, max_e24]
                 p_min_c = float(rv[ix_p_min_cal]) - LAPSE_F_PER_M * p_delta
                 p_min_m = (float(rv[ix_p_min_m24]) - LAPSE_F_PER_M * p_delta) if not np.isnan(rv[ix_p_min_m24]) else p_min_c
                 p_min_e = (float(rv[ix_p_min_e24]) - LAPSE_F_PER_M * p_delta) if not np.isnan(rv[ix_p_min_e24]) else p_min_c
@@ -577,7 +565,6 @@ def build_aligned_tensors(
                     valid_sample = False
                     break
 
-                # Blend NBM (2.5km Gridded MOS) or HRRR into anchor when present
                 if not np.isnan(rv[ix_n_min]) and not np.isnan(rv[ix_n_max_cal]):
                     n_min_c = float(rv[ix_n_min]) - LAPSE_F_PER_M * n_delta
                     n_max_c = float(rv[ix_n_max_cal]) - LAPSE_F_PER_M * n_delta
@@ -585,6 +572,7 @@ def build_aligned_tensors(
                     p_min_c = 0.55 * n_min_c + 0.45 * p_min_c
                     p_max_c = 0.55 * n_max_c + 0.45 * p_max_c
                     p_max_m = 0.55 * n_max_m + 0.45 * p_max_m
+                    p_max_e = 0.55 * n_max_c + 0.45 * p_max_e
                 elif d_idx < 2 and not np.isnan(rv[ix_h_min]) and not np.isnan(rv[ix_h_max_cal]):
                     h_min_c = float(rv[ix_h_min]) - LAPSE_F_PER_M * h_delta
                     h_max_c = float(rv[ix_h_max_cal]) - LAPSE_F_PER_M * h_delta
@@ -631,11 +619,7 @@ def build_aligned_tensors(
             snow_list.append(snow_sample)
             st_samples += 1
 
-        print(
-            f"  [{_ts()}] [tensors {st_i:02d}/{len(active_sids):02d}] {sid:6s} ({net_str}): "
-            f"{st_samples:,} 5-day sequences aligned",
-            flush=True,
-        )
+        print(f"  [{_ts()}] [tensors {st_i:02d}/{len(active_sids):02d}] {sid:6s} ({net_str}): {st_samples:,} sequences", flush=True)
 
     ctx_names = [
         "elev_km", "elev_delta_km", "lat_centered", "lon_centered", "obs_hour_norm",
@@ -673,36 +657,33 @@ def build_live_inference_bundle(
     afternoon_max_gate_utc: int = 23,
     min_causal_lag_hours: int = 48,
 ) -> tuple[TensorBundle | None, list[str]]:
-    """Builds a live 5-day operational inference TensorBundle for TODAY across all active FGZ sites."""
+    """
+    Builds today's live 5-day operational TensorBundle across all FGZ stations, passing
+    gfs + ifs + nbm + hrrr directly into build_aligned_tensors so NBM anchor blending &
+    IFS ensemble spread match training 1:1.
+    """
     if "gfs" not in live_hourly:
         return None, []
 
     today_mst = (pd.Timestamp(datetime.now(timezone.utc)) + pd.Timedelta(hours=MST_OFFSET_HOURS)).floor("D").tz_localize(None)
     horizon_dates = [today_mst + pd.Timedelta(days=d) for d in range(5)]
 
-    gfs_d = _aggregate_station_windows(live_hourly["gfs"], stations_df, "LIVE_GFS")
-    ifs_d = _aggregate_station_windows(live_hourly["ifs"], stations_df, "LIVE_IFS") if "ifs" in live_hourly else None
-    nbm_d = _aggregate_station_windows(live_hourly["nbm"], stations_df, "LIVE_NBM") if "nbm" in live_hourly else None
-    hrrr_d = _aggregate_station_windows(live_hourly["hrrr"], stations_df, "LIVE_HRRR") if "hrrr" in live_hourly else None
-
-    merged_tbl = _merge_canonical_day_table(gfs_d, None, ifs_d, nbm_d, hrrr_d)
-    lags_df = compute_causal_obs_lags(
-        coop_df, today_mst, issue_hour_utc, morning_min_gate_utc, afternoon_max_gate_utc, min_causal_lag_hours
-    ).set_index("station_id")
-
-    # Create synthetic target placeholders so build_aligned_tensors logic maps 1:1
     synth_obs_rows = []
     for sid in stations_df["station_id"]:
         for hd in horizon_dates + [today_mst - pd.Timedelta(days=k) for k in range(1, 10)]:
             synth_obs_rows.append({"station_id": sid, "obs_date": hd, "tmin_f": 40.0, "tmax_f": 65.0, "snowd": 0.0})
     synth_df = pd.DataFrame(synth_obs_rows)
-    real_sub = coop_df[coop_df["obs_date"] < today_mst][["station_id", "obs_date", "tmin_f", "tmax_f", "snowd"]]
-    comb_obs = pd.concat([real_sub, synth_df], ignore_index=True).drop_duplicates(subset=["station_id", "obs_date"], keep="first")
+
+    if coop_df is not None and not coop_df.empty:
+        real_sub = coop_df[coop_df["obs_date"] < today_mst][["station_id", "obs_date", "tmin_f", "tmax_f", "snowd"]]
+        comb_obs = pd.concat([real_sub, synth_df], ignore_index=True).drop_duplicates(subset=["station_id", "obs_date"], keep="first")
+    else:
+        comb_obs = synth_df
 
     bundle = build_aligned_tensors(
         stations_df=stations_df,
         coop_df=comb_obs,
-        hourly_by_source={"gfs": live_hourly["gfs"], **{k: v for k, v in live_hourly.items() if k == "hrrr"}},
+        hourly_by_source=live_hourly,
         mos_df=live_mos_df,
         issue_hour_utc=issue_hour_utc,
         morning_min_gate_utc=morning_min_gate_utc,
@@ -710,41 +691,13 @@ def build_live_inference_bundle(
         min_causal_lag_hours=min_causal_lag_hours,
         station_vocab=station_vocab,
     )
-    # Filter strictly to today's issue_date and inject NBM/IFS columns from merged_tbl
+
     today_d64 = today_mst.to_datetime64().astype("datetime64[D]")
     m_today = bundle.issue_dates == today_d64
     if not m_today.any():
         return None, [d.strftime("%Y-%m-%d") for d in horizon_dates]
 
-    table_cols = PRIMARY_SLOTS + IFS_SLOTS + NBM_SLOTS + HRRR_SLOTS + [
-        "ens_spread_tmin", "ens_spread_tmax_cal", "nbm_minus_gfs_tmin", "nbm_minus_gfs_tmax"
-    ]
-    pos_map = {name: i for i, name in enumerate(bundle.dyn_feature_names)}
-    tbl_idx = [pos_map[c] for c in table_cols]
-    hrrr_idx = [i for i, name in enumerate(bundle.dyn_feature_names) if name.startswith("hrrr_")]
-
     idx_sel = np.where(m_today)[0]
-    x_d = bundle.x_dyn[idx_sel].copy()
-    mk_d = bundle.mask_dyn[idx_sel].copy()
-    mt_indexed = merged_tbl.set_index(["station_id", "target_date"])
-
-    for row_i, sid in enumerate(bundle.station_ids[idx_sel]):
-        for d_i, hd in enumerate(horizon_dates):
-            if (sid, hd) in mt_indexed.index:
-                vals = mt_indexed.loc[(sid, hd), table_cols].to_numpy(dtype=np.float32)
-                if d_i >= 2:
-                    vals[[table_cols.index(c) for c in HRRR_SLOTS]] = np.nan
-                mk_d[row_i, d_i, tbl_idx] = (~np.isnan(vals)).astype(np.float32)
-                x_d[row_i, d_i, tbl_idx] = np.nan_to_num(vals, nan=0.0)
-            if d_i >= 2 and hrrr_idx:
-                mk_d[row_i, d_i, hrrr_idx] = 0.0
-                x_d[row_i, d_i, hrrr_idx] = 0.0
-            if sid in lags_df.index:
-                c_vec = lags_df.loc[sid].to_numpy(dtype=np.float32)
-                c_idx = [pos_map[c] for c in lags_df.columns]
-                mk_d[row_i, d_i, c_idx] = (~np.isnan(c_vec)).astype(np.float32)
-                x_d[row_i, d_i, c_idx] = np.nan_to_num(c_vec, nan=0.0)
-
     live_b = TensorBundle(
         issue_dates=bundle.issue_dates[idx_sel],
         station_ids=bundle.station_ids[idx_sel],
@@ -752,8 +705,8 @@ def build_live_inference_bundle(
         station_indices=bundle.station_indices[idx_sel],
         station_vocab=station_vocab,
         tiers=bundle.tiers[idx_sel],
-        x_dyn=x_d,
-        mask_dyn=mk_d,
+        x_dyn=bundle.x_dyn[idx_sel],
+        mask_dyn=bundle.mask_dyn[idx_sel],
         x_ctx=bundle.x_ctx[idx_sel],
         raw_anchor=bundle.raw_anchor[idx_sel],
         raw_anchor_candidates=bundle.raw_anchor_candidates[idx_sel],

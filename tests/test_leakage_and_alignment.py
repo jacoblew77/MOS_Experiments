@@ -5,17 +5,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from fgz_nn_lab.dashboard import build_github_pages_site
 from fgz_nn_lab.data_ingest import filter_coop_qc, load_station_catalog
 from fgz_nn_lab.features import build_aligned_tensors, compute_causal_obs_lags
-from fgz_nn_lab.models import apply_blend_weights, fit_l1_optimal_blend_weights
+from fgz_nn_lab.models import (
+    apply_network_aware_blend,
+    fit_conformal_residual_quantiles,
+    fit_network_aware_blend_weights,
+)
 from fgz_nn_lab.splits import FoldScaler, make_purged_expanding_splits
 
 
-def test_station_catalog_phantom_ranch_and_asos_seed() -> None:
+def test_station_catalog_phantom_ranch_and_26_seeds() -> None:
     df = load_station_catalog(Path("configs/stations_fgz_coop.json"), raw_dir=None)
     pr = df[df["station_id"] == "PHRA3"].iloc[0]
     assert pr["elev_ft"] == 2530.0
-    assert "KFLG" in df["uid"].values
+    assert "KPAN" in df["uid"].values
+    assert "KSEZ" in df["uid"].values
     assert "AZ0000" not in df["uid"].values
 
 
@@ -33,7 +39,7 @@ def test_strict_real_obs_qc_rejects_estimated_and_blanks() -> None:
     assert list(qc["station"]) == ["FLG"]
 
 
-def test_gating_and_l1_blend_weights() -> None:
+def test_network_aware_stack_and_conformal_quantiles(tmp_path: Path) -> None:
     dates = pd.date_range("2025-03-01", "2025-03-10", freq="D")
     coop = pd.DataFrame(
         {
@@ -47,13 +53,27 @@ def test_gating_and_l1_blend_weights() -> None:
     lags = compute_causal_obs_lags(coop, pd.Timestamp("2025-03-08"), 12, 15, 23, 48)
     assert lags["causal_last_tmin"].iloc[0] <= 15.0
 
-    y = np.zeros((50, 5, 2), dtype=np.float32)
-    pa = np.ones((50, 5, 2), dtype=np.float32) * 0.2
-    pb = np.ones((50, 5, 2), dtype=np.float32) * 3.0
-    w = fit_l1_optimal_blend_weights(pa, pb, y)
-    assert (w == 1.0).all()
-    blended = apply_blend_weights(pa, pb, w)
-    assert np.allclose(blended, pa)
+    y = np.zeros((100, 5, 2), dtype=np.float32)
+    nets = np.array(["AZ_ASOS"] * 50 + ["AZ_COOP"] * 50)
+    p_nn = np.ones((100, 5, 2), dtype=np.float32) * 2.5
+    p_lg = np.ones((100, 5, 2), dtype=np.float32) * 0.1
+    p_nn[50:] = 0.1  # NN wins on COOP
+    p_lg[50:] = 2.5  # LGBM wins on ASOS
+
+    w_map = fit_network_aware_blend_weights(p_nn, p_lg, y, nets)
+    assert np.allclose(w_map["AZ_ASOS"], 0.0)
+    assert np.allclose(w_map["AZ_COOP"], 1.0)
+    blended = apply_network_aware_blend(p_nn, p_lg, nets, w_map)
+    assert np.allclose(blended, 0.1)
+
+    q_map = fit_conformal_residual_quantiles(blended, y, nets)
+    assert q_map["AZ_COOP"]["q10"].shape == (5, 2)
+
+    st_df = pd.DataFrame([{"station_id": "KFLG", "name": "Flagstaff", "lat": 35.14, "lon": -111.67, "elev_ft": 7011.0, "tier": "basin_plateau", "network": "AZ_ASOS"}])
+    live = [{"station_id": "KFLG", "name": "Flagstaff", "network": "AZ_ASOS", "forecasts": [{"day": 1, "date": "2026-11-27", "tmin_f": 25.0, "tmin_p10_f": 21.5, "tmin_p90_f": 28.5, "tmax_f": 55.0, "tmax_p10_f": 52.5, "tmax_p90_f": 57.5, "nn_tmin_f": 24.8, "lgbm_tmin_f": 25.2}]}]
+    idx_html = build_github_pages_site(tmp_path, st_df, live, [], {"KFLG": {"mae_min": 2.4, "mae_max": 1.5}})
+    assert idx_html.exists()
+    assert (tmp_path / "forecasts_latest.csv").exists()
 
 
 def test_sparse_channel_guard_and_purged_splits() -> None:

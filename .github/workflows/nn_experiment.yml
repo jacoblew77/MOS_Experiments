@@ -1,10 +1,21 @@
-name: FGZ COOP + ASOS Operational AI-MOS Suite
+name: FGZ Operational AI-MOS & GitHub Pages Forecast
 
 on:
+  schedule:
+    - cron: "15 13 * * *"  # Daily at 13:15 UTC (06:15 AM MST, right after 12Z NBM & MOS arrive)
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Execution mode ('auto' = train once then fast 40s forecast; 'retrain' = force full benchmark)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - forecast
+          - retrain
       fast_smoke:
-        description: "Optional fast smoke test (leave unchecked for full operational run)"
+        description: "Optional fast smoke test (leave unchecked for operational run)"
         required: false
         default: false
         type: boolean
@@ -15,8 +26,17 @@ on:
       - "tests/**"
       - ".github/workflows/nn_experiment.yml"
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "fgz-mos-pipeline-and-pages"
+  cancel-in-progress: false
+
 jobs:
-  operational-suite:
+  forecast-and-train:
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
@@ -36,66 +56,101 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install -e ".[dev]"
 
-      - name: Run zero-estimated QC, gating, and alignment unit tests
+      - name: Run zero-estimated QC, network-stack, and dashboard unit tests
         run: pytest -v
 
-      - name: Restore cached Parquet archives
-        if: github.event_name == 'workflow_dispatch'
+      - name: Restore cached Parquet archives & trained model checkpoints
+        if: github.event_name != 'push'
         uses: actions/cache/restore@v4
         with:
-          path: data/raw
-          key: fgz-op-v4-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-${{ github.run_id }}
+          path: |
+            data/raw
+            data/models
+          key: fgz-op-v5-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-${{ github.run_id }}
           restore-keys: |
-            fgz-op-v4-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-
+            fgz-op-v5-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-
+            fgz-op-v5-
             fgz-op-v4-
 
-      - name: Snapshot raw file count
+      - name: Snapshot cache file count
         id: pre-count
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'push'
         run: |
-          mkdir -p data/raw
-          echo "count=$(find data/raw -type f | wc -l)" >> $GITHUB_OUTPUT
+          mkdir -p data/raw data/models
+          echo "count=$(find data/raw data/models -type f | wc -l)" >> $GITHUB_OUTPUT
+          CKPT_MTIME=$(stat -c %Y data/models/fgz_op_v4_checkpoint.pkl 2>/dev/null || echo 0)
+          echo "ckpt_mtime=$CKPT_MTIME" >> $GITHUB_OUTPUT
 
-      - name: Run Full One-Click Operational Experiment & Live 5-Day Forecast
-        if: github.event_name == 'workflow_dispatch'
+      - name: Execute FGZ Operational AI-MOS Pipeline & Build GitHub Pages Map
+        if: github.event_name != 'push'
         env:
           PYTHONUNBUFFERED: "1"
         run: |
+          RUN_MODE="forecast"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUN_MODE="${{ inputs.mode || 'auto' }}"
+          fi
           SMOKE_ARG=""
           if [ "${{ inputs.fast_smoke }}" = "true" ]; then
             SMOKE_ARG="--fast-smoke"
           fi
-          python scripts/run_pipeline.py $SMOKE_ARG
+          python scripts/run_pipeline.py --mode "$RUN_MODE" $SMOKE_ARG
 
-      - name: Check for new cache files
-        if: always() && github.event_name == 'workflow_dispatch'
+      - name: Check for updated cache or checkpoint files
+        if: always() && github.event_name != 'push'
         run: |
-          AFTER_COUNT=$(find data/raw -type f 2>/dev/null | wc -l || echo 0)
-          if [ "$AFTER_COUNT" != "${{ steps.pre-count.outputs.count }}" ]; then
-            echo "NEW_CACHE_FILES=true" >> $GITHUB_ENV
+          rm -rf data/raw/live_obs_tmp
+          AFTER_COUNT=$(find data/raw data/models -type f 2>/dev/null | wc -l || echo 0)
+          AFTER_MTIME=$(stat -c %Y data/models/fgz_op_v4_checkpoint.pkl 2>/dev/null || echo 0)
+          if [ "$AFTER_COUNT" != "${{ steps.pre-count.outputs.count }}" ] || [ "$AFTER_MTIME" != "${{ steps.pre-count.outputs.ckpt_mtime }}" ]; then
+            echo "SAVE_CACHE=true" >> $GITHUB_ENV
           else
-            echo "NEW_CACHE_FILES=false" >> $GITHUB_ENV
+            echo "SAVE_CACHE=false" >> $GITHUB_ENV
           fi
 
-      - name: Save Parquet cache
-        if: always() && github.event_name == 'workflow_dispatch' && env.NEW_CACHE_FILES == 'true'
+      - name: Persist Parquet & Checkpoint Cache
+        if: always() && github.event_name != 'push' && env.SAVE_CACHE == 'true'
         uses: actions/cache/save@v4
         with:
-          path: data/raw
-          key: fgz-op-v4-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-${{ github.run_id }}
+          path: |
+            data/raw
+            data/models
+          key: fgz-op-v5-${{ hashFiles('configs/stations_fgz_coop.json', 'configs/experiment.yaml') }}-${{ github.run_id }}
 
       - name: Print Leaderboard to Job Summary
-        if: github.event_name == 'workflow_dispatch' && hashFiles('data/runs/leaderboard.csv') != ''
+        if: github.event_name != 'push' && hashFiles('data/runs/leaderboard.csv') != ''
         run: |
-          echo "## FGZ COOP + ASOS Operational 5-Day MAE Leaderboard (°F)" >> $GITHUB_STEP_SUMMARY
+          echo "## FGZ COOP + ASOS Operational v4 Leaderboard (°F)" >> $GITHUB_STEP_SUMMARY
           echo '```csv' >> $GITHUB_STEP_SUMMARY
           cat data/runs/leaderboard.csv >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload Single Master Drop-In JSON
-        if: github.event_name == 'workflow_dispatch' && hashFiles('data/runs/master_analysis_bundle.json') != ''
+        if: github.event_name != 'push' && hashFiles('data/runs/master_analysis_bundle.json') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: fgz-operational-master-${{ github.run_number }}
+          name: fgz-operational-v4-master-${{ github.run_number }}
           path: data/runs/master_analysis_bundle.json
           retention-days: 7
+
+      - name: Configure GitHub Pages
+        if: github.event_name != 'push' && hashFiles('site/index.html') != ''
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages Map Artifact
+        if: github.event_name != 'push' && hashFiles('site/index.html') != ''
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-pages:
+    if: github.event_name != 'push'
+    needs: forecast-and-train
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Forecast Portal to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

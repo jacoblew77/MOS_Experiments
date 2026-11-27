@@ -55,7 +55,6 @@ PREV_GFS_BASE_VARS = [
     "wind_speed_10m",
 ]
 
-# Streamlined 4-variable core for secondary ensemble members (cuts Open-Meteo credit weight by 33%)
 PREV_COMPACT_BASE_VARS = [
     "temperature_2m",
     "dew_point_2m",
@@ -79,19 +78,23 @@ LIVE_FORECAST_VARS = [
 
 
 class OpenMeteoDailyQuotaError(RuntimeError):
-    """Raised when a runner IP hits Open-Meteo's 24h UTC limit (Retry-After > 300s)."""
+    """Raised when a runner IP hits Open-Meteo's 24h UTC limit (Retry-After > 1200s)."""
 
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
+def _det_sig(items: list[str]) -> int:
+    return sum((i + 1) * sum(ord(c) for c in s) for i, s in enumerate(items)) % 100000
+
+
 def _classify_fgz_tier(sid: str, name: str, elev_ft: float) -> str:
     up = f"{sid} {name}".upper()
-    if any(k in up for k in ("PHANTOM", "PHRA3", "PAGE", "PGA", "CANYON", "LEES FERRY", "SUPAI")):
-        if elev_ft < 4600.0:
+    if any(k in up for k in ("PHANTOM", "PHRA3", "PAGE", "PGA", "CANYON", "COTTONWOOD", "P52", "CHELLY", "CHNA3")):
+        if elev_ft < 5600.0:
             return "canyon"
-    if any(k in up for k in ("RIM", "PAYSON", "PRESCOTT", "PRC", "SHOW LOW", "SOW", "GRAND CANYON", "GCN", "JEROME", "PINE")):
+    if any(k in up for k in ("RIM", "PAYSON", "PAN", "PRESCOTT", "PRC", "SEDONA", "SEZ", "SHOW LOW", "SOW", "GRAND CANYON", "GCN", "ALPINE", "ALPA3")):
         return "rim_slope"
     return "basin_plateau"
 
@@ -107,11 +110,13 @@ def _build_prev_runs_var_list(max_prev_day: int, compact: bool = False) -> list[
 
 
 def _nearest_asos_mos_id(lat: float, lon: float, asos_rows: list[dict[str, Any]]) -> str:
-    if not asos_rows:
+    core_mos = [r for r in asos_rows if str(r["mos_id"]) in {"KFLG", "KPRC", "KINW", "KSJN", "KGCN", "KPGA", "KRQE", "KSOW"}]
+    pool = core_mos if core_mos else asos_rows
+    if not pool:
         return "KFLG"
     best_id = "KFLG"
     best_d2 = 1e12
-    for r in asos_rows:
+    for r in pool:
         d2 = (lat - float(r["lat"])) ** 2 + (lon - float(r["lon"])) ** 2
         if d2 < best_d2:
             best_d2 = d2
@@ -160,11 +165,9 @@ def load_station_catalog(config_path: Path, raw_dir: Path | None = None) -> pd.D
                 try:
                     r = requests.get(IEM_GEOJSON_URL.format(network=net), timeout=45)
                     if r.status_code == 200:
-                        feats = r.json().get("features", [])
-                        for f in feats:
+                        for f in r.json().get("features", []):
                             props = f.get("properties", {})
-                            geom = f.get("geometry", {})
-                            coords = geom.get("coordinates", [None, None])
+                            coords = f.get("geometry", {}).get("coordinates", [None, None])
                             wfo = str(props.get("wfo", "")).strip().upper()
                             online = bool(props.get("online", True))
                             archive_end = props.get("archive_end")
@@ -198,9 +201,7 @@ def load_station_catalog(config_path: Path, raw_dir: Path | None = None) -> pd.D
             sid = d["station_id"]
             net = d["network"]
             elev_ft = float(overrides.get(sid, d["elev_ft"]))
-            mos_id = f"K{sid}" if net == "AZ_ASOS" and len(sid) == 3 else _nearest_asos_mos_id(
-                float(d["lat"]), float(d["lon"]), asos_seeds
-            )
+            mos_id = _nearest_asos_mos_id(float(d["lat"]), float(d["lon"]), asos_seeds)
             by_key[k] = {
                 "station_id": sid,
                 "network": net,
@@ -263,23 +264,23 @@ def fetch_unestimated_iem_observations(
     raw_dir: Path,
     min_clean_days: int = 380,
     min_recent_days: int = 150,
-    max_coop: int = 12,
-    max_asos: int = 8,
+    max_coop: int = 14,
+    max_asos: int = 12,
+    check_estimated_txt: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     raw_dir.mkdir(parents=True, exist_ok=True)
-    cache_tag = f"{start_date}_{end_date}_{min_clean_days}d_{len(stations_df)}cand"
-    obs_cache = raw_dir / f"iem_real_daily_v3_{cache_tag}.parquet"
-    aud_cache = raw_dir / f"iem_real_audit_v3_{cache_tag}.parquet"
-    sel_cache = raw_dir / f"iem_selected_stations_v3_{cache_tag}.parquet"
+    cache_tag = f"{start_date}_{end_date}_{min_clean_days}d_{max_asos}a_{max_coop}c_{len(stations_df)}cand"
+    obs_cache = raw_dir / f"iem_real_daily_v4_{cache_tag}.parquet"
+    aud_cache = raw_dir / f"iem_real_audit_v4_{cache_tag}.parquet"
+    sel_cache = raw_dir / f"iem_selected_stations_v4_{cache_tag}.parquet"
 
     if obs_cache.exists() and aud_cache.exists() and sel_cache.exists():
         obs_df = pd.read_parquet(obs_cache)
         aud_df = pd.read_parquet(aud_cache)
         sel_df = pd.read_parquet(sel_cache)
         print(
-            f"  [{_ts()}] [OBS] Cache HIT -> {len(obs_df):,} genuine un-estimated rows across "
-            f"{len(sel_df)} active FGZ sites ({(sel_df['network']=='AZ_ASOS').sum()} ASOS, "
-            f"{(sel_df['network']=='AZ_COOP').sum()} COOP)",
+            f"  [{_ts()}] [OBS] Cache HIT -> {len(obs_df):,} un-estimated rows across "
+            f"{len(sel_df)} FGZ sites ({(sel_df['network']=='AZ_ASOS').sum()} ASOS, {(sel_df['network']=='AZ_COOP').sum()} COOP)",
             flush=True,
         )
         return obs_df, aud_df, sel_df
@@ -290,13 +291,11 @@ def fetch_unestimated_iem_observations(
 
     net_frames: list[pd.DataFrame] = []
     raw_count_by_uid: dict[str, int] = {}
-    uid_col = "uid" if "uid" in stations_df.columns else "station_id"
     iem_col = "iem_sid" if "iem_sid" in stations_df.columns else "station_id"
 
     st_query_df = stations_df.copy()
     if "uid" not in st_query_df.columns:
         st_query_df["uid"] = st_query_df["station_id"]
-    # Strip leading 'K' when querying AZ_ASOS on IEM daily.py if station_id was already promoted to uid
     st_query_df["_query_sid"] = np.where(
         (st_query_df["network"] == "AZ_ASOS") & st_query_df[iem_col].str.startswith("K") & (st_query_df[iem_col].str.len() == 4),
         st_query_df[iem_col].str[1:],
@@ -305,12 +304,12 @@ def fetch_unestimated_iem_observations(
 
     for net_i, (net_name, net_grp) in enumerate(st_query_df.groupby("network")):
         if net_i > 0:
-            time.sleep(2.5)
+            time.sleep(2.2)
         sids = net_grp["_query_sid"].tolist()
         uid_map = dict(zip(net_grp["_query_sid"], net_grp["uid"]))
         print(
-            f"  [{_ts()}] [OBS] Querying IEM daily.py (na=blank, non-estimated) for {net_name} "
-            f"({len(sids)} candidate stations, {start_date}..{end_date})...",
+            f"  [{_ts()}] [OBS] Querying IEM daily.py (na=blank, 0% estimated) for {net_name} "
+            f"({len(sids)} stations, {start_date}..{end_date})...",
             flush=True,
         )
         params = {
@@ -361,7 +360,7 @@ def fetch_unestimated_iem_observations(
 
     coop_est_bad: set[tuple[str, str]] = set()
     detected_obs_hr: dict[str, int] = {}
-    if not all_qc.empty and (st_query_df["network"] == "AZ_COOP").any():
+    if check_estimated_txt and not all_qc.empty and (st_query_df["network"] == "AZ_COOP").any():
         for yr in range(max(dt_start.year, dt_end.year - 2), dt_end.year + 1):
             for st_r in st_query_df[st_query_df["network"] == "AZ_COOP"].itertuples():
                 try:
@@ -482,83 +481,103 @@ def fetch_unestimated_iem_observations(
     return obs_final, audit_df, selected_df
 
 
+def _parse_mos_csv_text(csv_text: str, m_id: str) -> pd.DataFrame:
+    lines = [ln for ln in csv_text.splitlines() if ln.strip() and not ln.startswith("#")]
+    if len(lines) <= 1:
+        return pd.DataFrame()
+    df = pd.read_csv(io.StringIO("\n".join(lines)), low_memory=False)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "runtime" not in df.columns or "ftime" not in df.columns:
+        return pd.DataFrame()
+
+    df["runtime_utc"] = pd.to_datetime(df["runtime"], utc=True, errors="coerce").dt.tz_localize(None)
+    df["ftime_utc"] = pd.to_datetime(df["ftime"], utc=True, errors="coerce").dt.tz_localize(None)
+    df = df.dropna(subset=["runtime_utc", "ftime_utc"]).copy()
+    df = df[df["runtime_utc"].dt.hour == 12].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["issue_date"] = df["runtime_utc"].dt.floor("D")
+    df["target_date"] = (df["ftime_utc"] - pd.Timedelta(hours=7)).dt.floor("D")
+    df["tmp_num"] = pd.to_numeric(df.get("tmp", np.nan), errors="coerce")
+    df["nx_num"] = pd.to_numeric(df.get("n_x", np.nan), errors="coerce")
+    # MEX uses 'x_n' or 'n_x' depending on bulletin format
+    if "x_n" in df.columns:
+        df["nx_num"] = df["nx_num"].combine_first(pd.to_numeric(df["x_n"], errors="coerce"))
+    df["dpt_num"] = pd.to_numeric(df.get("dpt", np.nan), errors="coerce")
+    df["wsp_num"] = pd.to_numeric(df.get("wsp", np.nan), errors="coerce")
+
+    grp = df.groupby(["issue_date", "target_date"], as_index=False).agg(
+        mos_tmin_3h=("tmp_num", "min"),
+        mos_tmax_3h=("tmp_num", "max"),
+        mos_nx_min=("nx_num", "min"),
+        mos_nx_max=("nx_num", "max"),
+        mos_dpt_mean=("dpt_num", "mean"),
+        mos_wsp_mean=("wsp_num", "mean"),
+    )
+    grp["mos_tmin_f"] = grp["mos_nx_min"].combine_first(grp["mos_tmin_3h"])
+    grp["mos_tmax_f"] = grp["mos_nx_max"].combine_first(grp["mos_tmax_3h"])
+    grp["mos_id"] = m_id
+    return grp[["mos_id", "issue_date", "target_date", "mos_tmin_f", "mos_tmax_f", "mos_dpt_mean", "mos_wsp_mean"]]
+
+
 def fetch_iem_mos_bulletins(
     stations_df: pd.DataFrame,
     start_date: str,
     end_date: str,
     raw_dir: Path,
 ) -> pd.DataFrame:
+    """
+    Fetches BOTH 12Z Short-Range GFS MOS ('GFS', Days 1-3) AND 12Z GFS Extended MOS ('MEX', Days 4-5)
+    from IEM so mos_bulletin_* channels have full 5-day (24h..120h) coverage!
+    """
     raw_dir.mkdir(parents=True, exist_ok=True)
     mos_ids = sorted(stations_df["mos_id"].dropna().unique().tolist())
-    mos_cache = raw_dir / f"iem_gfs_mos_v3_{start_date}_{end_date}_{len(mos_ids)}st.parquet"
+    mos_cache = raw_dir / f"iem_gfs_mex_mos_v4_{start_date}_{end_date}_{_det_sig(mos_ids)}.parquet"
     if mos_cache.exists():
         mdf = pd.read_parquet(mos_cache)
         print(f"  [{_ts()}] [MOS Bulletins] Cache HIT -> {mos_cache.name} ({len(mdf):,} rows)", flush=True)
         return mdf
 
     dt_s = pd.Timestamp(start_date)
-    dt_e = pd.Timestamp(end_date) + pd.Timedelta(days=5)
+    dt_e = pd.Timestamp(end_date) + pd.Timedelta(days=6)
     frames: list[pd.DataFrame] = []
 
     print(
-        f"  [{_ts()}] [MOS Bulletins] Fetching IEM GFS MOS archive for {len(mos_ids)} FGZ airports ({mos_ids})...",
+        f"  [{_ts()}] [MOS Bulletins] Fetching 12Z GFS (MAV D1-3) + MEX (Extended D4-5) MOS for {mos_ids}...",
         flush=True,
     )
     for m_id in mos_ids:
-        try:
-            params = {
-                "station": m_id,
-                "model": "GFS",
-                "sts": dt_s.strftime("%Y-%m-%dT00:00Z"),
-                "ets": dt_e.strftime("%Y-%m-%dT23:59Z"),
-                "format": "csv",
-            }
-            r = requests.get(IEM_MOS_CGI_URL, params=params, timeout=75)
-            if r.status_code != 200 or "," not in r.text:
-                time.sleep(1.5)
-                continue
-            lines = [ln for ln in r.text.splitlines() if ln.strip() and not ln.startswith("#")]
-            if len(lines) <= 1:
-                time.sleep(1.5)
-                continue
-            df = pd.read_csv(io.StringIO("\n".join(lines)), low_memory=False)
-            df.columns = [c.strip().lower() for c in df.columns]
-            if "runtime" not in df.columns or "ftime" not in df.columns:
-                time.sleep(1.5)
-                continue
+        st_parts: list[pd.DataFrame] = []
+        for mod_name in ("GFS", "MEX"):
+            try:
+                params = {
+                    "station": m_id,
+                    "model": mod_name,
+                    "sts": dt_s.strftime("%Y-%m-%dT00:00Z"),
+                    "ets": dt_e.strftime("%Y-%m-%dT23:59Z"),
+                    "format": "csv",
+                }
+                r = requests.get(IEM_MOS_CGI_URL, params=params, timeout=75)
+                if r.status_code == 200 and "," in r.text:
+                    parsed = _parse_mos_csv_text(r.text, m_id)
+                    if not parsed.empty:
+                        parsed["_priority"] = 0 if mod_name == "GFS" else 1
+                        st_parts.append(parsed)
+                time.sleep(1.6)
+            except Exception:
+                time.sleep(1.2)
 
-            df["runtime_utc"] = pd.to_datetime(df["runtime"], utc=True, errors="coerce").dt.tz_localize(None)
-            df["ftime_utc"] = pd.to_datetime(df["ftime"], utc=True, errors="coerce").dt.tz_localize(None)
-            df = df.dropna(subset=["runtime_utc", "ftime_utc"]).copy()
-            df = df[df["runtime_utc"].dt.hour == 12].copy()
-            if df.empty:
-                time.sleep(1.5)
-                continue
-
-            df["issue_date"] = df["runtime_utc"].dt.floor("D")
-            df["target_date"] = (df["ftime_utc"] - pd.Timedelta(hours=7)).dt.floor("D")
-            df["tmp_num"] = pd.to_numeric(df.get("tmp", np.nan), errors="coerce")
-            df["nx_num"] = pd.to_numeric(df.get("n_x", np.nan), errors="coerce")
-            df["dpt_num"] = pd.to_numeric(df.get("dpt", np.nan), errors="coerce")
-            df["wsp_num"] = pd.to_numeric(df.get("wsp", np.nan), errors="coerce")
-
-            grp = df.groupby(["issue_date", "target_date"], as_index=False).agg(
-                mos_tmin_3h=("tmp_num", "min"),
-                mos_tmax_3h=("tmp_num", "max"),
-                mos_nx_min=("nx_num", "min"),
-                mos_nx_max=("nx_num", "max"),
-                mos_dpt_mean=("dpt_num", "mean"),
-                mos_wsp_mean=("wsp_num", "mean"),
+        if st_parts:
+            # Prefer high-res 3h GFS MAV on Days 1-3, fill Days 4-5 seamlessly with 12Z MEX!
+            merged_m = (
+                pd.concat(st_parts, ignore_index=True)
+                .sort_values(["issue_date", "target_date", "_priority"])
+                .drop_duplicates(subset=["mos_id", "issue_date", "target_date"], keep="first")
+                .drop(columns=["_priority"])
             )
-            grp["mos_tmin_f"] = grp["mos_nx_min"].combine_first(grp["mos_tmin_3h"])
-            grp["mos_tmax_f"] = grp["mos_nx_max"].combine_first(grp["mos_tmax_3h"])
-            grp["mos_id"] = m_id
-            frames.append(grp[["mos_id", "issue_date", "target_date", "mos_tmin_f", "mos_tmax_f", "mos_dpt_mean", "mos_wsp_mean"]])
-            print(f"    [{_ts()}] [MOS] {m_id}: extracted {len(grp):,} daily 12Z GFS-MOS projections", flush=True)
-            time.sleep(2.0)
-        except Exception as exc:
-            print(f"    [{_ts()}] [MOS] {m_id} skipped ({type(exc).__name__})", flush=True)
-            time.sleep(1.5)
+            frames.append(merged_m)
+            print(f"    [{_ts()}] [MOS] {m_id}: {len(merged_m):,} daily D1-5 projections (GFS+MEX)", flush=True)
 
     full_mos = (
         pd.concat(frames, ignore_index=True)
@@ -577,11 +596,6 @@ def _request_open_meteo_json(
     retries: int = 12,
     read_timeout: int = 150,
 ) -> Any:
-    """
-    Handles per-minute & rolling-hour 429s with bounded sleeps (<=120s), and immediately raises
-    OpenMeteoDailyQuotaError if Retry-After > 1200s (daily UTC IP ceiling) so the workflow
-    never hangs for hours.
-    """
     delay = 10.0
     for attempt in range(retries):
         try:
@@ -631,6 +645,77 @@ def _build_date_windows(start_date: str, end_date: str, chunk_months: int) -> li
     return windows
 
 
+def _salvage_cached_stations(
+    raw_dir: Path,
+    chunk_dir: Path,
+    src: str,
+    eff_start: str,
+    pad_end: str,
+    target_sids: list[str],
+    canonical_vars: list[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Reuses 100% of stations already downloaded in Iteration 3 (`hourly_v3_*` / `chunk_v3_*`)
+    or earlier Iteration 4 runs so Open-Meteo is ONLY queried for newly added delta stations!
+    """
+    want = set(target_sids)
+    covered: set[str] = set()
+    frames: list[pd.DataFrame] = []
+
+    candidates = sorted(
+        list(raw_dir.glob(f"hourly_v4_{src}_{eff_start}_{pad_end}_*.parquet"))
+        + list(raw_dir.glob(f"hourly_v3_{src}_{eff_start}_{pad_end}_*.parquet")),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    for c_path in candidates:
+        try:
+            df = pd.read_parquet(c_path)
+            if "station_id" not in df.columns:
+                continue
+            avail = set(df["station_id"].unique()).intersection(want - covered)
+            if avail:
+                sub = df[df["station_id"].isin(avail)].copy()
+                for v in canonical_vars:
+                    if v not in sub.columns:
+                        sub[v] = np.float32(np.nan)
+                frames.append(sub)
+                covered.update(avail)
+            if covered == want:
+                break
+        except Exception:
+            continue
+
+    # Also check partial chunk_v3_* caches (e.g., prev_ifs / prev_nbm) if full file wasn't written
+    if not covered and chunk_dir.exists():
+        ch_files = sorted(chunk_dir.glob(f"chunk_v3_{src}_*.parquet"))
+        if ch_files:
+            ch_parts = []
+            for cp in ch_files:
+                try:
+                    cdf = pd.read_parquet(cp)
+                    ch_parts.append(cdf[cdf["station_id"].isin(want)])
+                except Exception:
+                    continue
+            if ch_parts:
+                comb_ch = pd.concat(ch_parts, ignore_index=True)
+                # Only treat a station as fully covered if it spans most of eff_start..pad_end
+                expected_hours = max(24, int((pd.Timestamp(pad_end) - pd.Timestamp(eff_start)).days * 20))
+                cnts = comb_ch.groupby("station_id")["time_utc"].count()
+                good_sids = set(cnts[cnts >= expected_hours].index).intersection(want)
+                if good_sids:
+                    sub = comb_ch[comb_ch["station_id"].isin(good_sids)].copy()
+                    for v in canonical_vars:
+                        if v not in sub.columns:
+                            sub[v] = np.float32(np.nan)
+                    frames.append(sub)
+                    covered.update(good_sids)
+
+    salvaged_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    missing_sids = [s for s in target_sids if s not in covered]
+    return salvaged_df, missing_sids
+
+
 def _fetch_batched_multi_station_chunks(
     session: requests.Session,
     src_label: str,
@@ -651,8 +736,7 @@ def _fetch_batched_multi_station_chunks(
     total_chunks = len(windows)
 
     sids = stations_df["station_id"].tolist()
-    # Deterministic hash (Python built-in hash() is salted per process!)
-    st_sig = sum((i + 1) * sum(ord(c) for c in s) for i, s in enumerate(sids)) % 100000
+    st_sig = _det_sig(sids)
     lats_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lat"])
     lons_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lon"])
     elev_csv = ",".join(["nan"] * len(sids))
@@ -662,16 +746,9 @@ def _fetch_batched_multi_station_chunks(
     complete = True
 
     for idx, (s_str, e_str) in enumerate(windows, start=1):
-        # Match existing cached chunk_v3_* files from prior runs if any exist!
-        existing_matches = list(chunk_dir.glob(f"chunk_v3_{src_label}_{s_str}_{e_str}_{len(sids)}st_*.parquet"))
-        chunk_file = existing_matches[0] if existing_matches else (
-            chunk_dir / f"chunk_v3_{src_label}_{s_str}_{e_str}_{len(sids)}st_{st_sig}.parquet"
-        )
+        chunk_file = chunk_dir / f"chunk_v4_{src_label}_{s_str}_{e_str}_{len(sids)}st_{st_sig}.parquet"
         if chunk_file.exists():
-            print(
-                f"  [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] Cache HIT  {s_str} -> {e_str}",
-                flush=True,
-            )
+            print(f"  [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] Delta Cache HIT {s_str} -> {e_str}", flush=True)
             cdf_hit = pd.read_parquet(chunk_file)
             for v in canonical_vars:
                 if v not in cdf_hit.columns:
@@ -681,7 +758,7 @@ def _fetch_batched_multi_station_chunks(
 
         print(
             f"  [{_ts()}] [{src_label.upper():9s} {idx:02d}/{total_chunks:02d}] "
-            f"Requesting {s_str} -> {e_str} ({len(sids)} stations, {len(requested_vars)} vars)...",
+            f"Fetching DELTA ({len(sids)} new stations, {len(requested_vars)} vars): {s_str} -> {e_str}...",
             flush=True,
         )
         t0 = time.monotonic()
@@ -705,11 +782,7 @@ def _fetch_batched_multi_station_chunks(
             payload = _request_open_meteo_json(session, src_label, url, params)
         except OpenMeteoDailyQuotaError as q_err:
             if allow_partial_on_daily_cap:
-                print(
-                    f"    [{_ts()}] [{src_label.upper()}] {q_err} — masking remaining {src_label} chunks "
-                    f"so single workflow completes without hanging!",
-                    flush=True,
-                )
+                print(f"    [{_ts()}] [{src_label.upper()}] {q_err} — masking remaining optional chunks.", flush=True)
                 complete = False
                 break
             raise
@@ -721,10 +794,7 @@ def _fetch_batched_multi_station_chunks(
             grid_elev = float(item["elevation"]) if item.get("elevation") is not None else np.nan
             cdf = pd.DataFrame({"time_utc": pd.to_datetime(hourly["time"])})
             for v in canonical_vars:
-                if v in hourly:
-                    cdf[v] = pd.to_numeric(hourly[v], errors="coerce").astype(np.float32)
-                else:
-                    cdf[v] = np.float32(np.nan)
+                cdf[v] = pd.to_numeric(hourly[v], errors="coerce").astype(np.float32) if v in hourly else np.float32(np.nan)
             cdf["grid_elev_m"] = np.float32(grid_elev)
             cdf["station_id"] = sid
             loc_dfs.append(cdf)
@@ -759,92 +829,82 @@ def fetch_hourly_predictors_for_stations(
     source_mode: str = "true_lead_nwp",
 ) -> dict[str, pd.DataFrame]:
     raw_dir.mkdir(parents=True, exist_ok=True)
-    chunk_dir = raw_dir / "chunks_v3"
+    chunk_dir_v3 = raw_dir / "chunks_v3"
+    chunk_dir_v4 = raw_dir / "chunks_v4"
     pad_start = (pd.Timestamp(start_date) - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
     pad_end = (pd.Timestamp(end_date) + pd.Timedelta(days=6)).strftime("%Y-%m-%d")
 
     if source_mode == "era5":
-        # 2020-2026 across 20 stations = ~100,000 station-days while keeping API weight compact
-        if len(stations_df) >= 12 and pd.Timestamp(pad_start) < pd.Timestamp("2020-01-01"):
-            pad_start = "2020-01-01"
+        if len(stations_df) >= 12 and pd.Timestamp(pad_start) < pd.Timestamp("2021-01-01"):
+            pad_start = "2021-01-01"
         sources = ["era5"]
     else:
         sources = ["era5", "gfs_hist", "prev_hrrr", "prev_gfs", "prev_ifs", "prev_nbm"]
 
     sids_sorted = sorted(stations_df["station_id"].tolist())
-    st_sig = sum((i + 1) * sum(ord(c) for c in s) for i, s in enumerate(sids_sorted)) % 100000
+    st_sig = _det_sig(sids_sorted)
     collected: dict[str, pd.DataFrame] = {}
 
+    src_spec_map = {
+        "era5": (OPEN_METEO_ARCHIVE_URL, ERA5_HOURLY_VARS, ERA5_HOURLY_VARS, None, 12, 0.8, (source_mode == "era5")),
+        "gfs_hist": (OPEN_METEO_HIST_FORECAST_URL, HIST_SUPPLEMENT_VARS, HIST_SUPPLEMENT_VARS, {"models": "gfs_seamless"}, 8, 0.9, False),
+        "prev_hrrr": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(1, False), _build_prev_runs_var_list(1, False), {"models": "ncep_hrrr_conus"}, 6, 1.0, False),
+        "prev_gfs": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, False), _build_prev_runs_var_list(4, False), {"models": "gfs_seamless"}, 4, 1.0, False),
+        "prev_ifs": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, True), _build_prev_runs_var_list(4, False), {"models": "ecmwf_ifs"}, 6, 1.0, True),
+        "prev_nbm": (OPEN_METEO_PREV_RUNS_URL, _build_prev_runs_var_list(4, True), _build_prev_runs_var_list(4, False), {"models": "ncep_nbm_conus"}, 6, 1.0, True),
+    }
+
     with requests.Session() as session:
-        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.6"})
+        session.headers.update({"Accept-Encoding": "gzip, deflate", "User-Agent": "fgz-nn-lab/0.7"})
         for s_i, src in enumerate(sources, start=1):
             eff_start = max(pad_start, "2024-10-05") if src == "prev_nbm" else pad_start
             if pd.Timestamp(eff_start) > pd.Timestamp(pad_end):
                 continue
 
-            existing_src = list(raw_dir.glob(f"hourly_v3_{src}_{eff_start}_{pad_end}_{len(stations_df)}st_*.parquet"))
-            src_cache = existing_src[0] if existing_src else (
-                raw_dir / f"hourly_v3_{src}_{eff_start}_{pad_end}_{len(stations_df)}st_{st_sig}.parquet"
-            )
+            src_cache = raw_dir / f"hourly_v4_{src}_{eff_start}_{pad_end}_{len(stations_df)}st_{st_sig}.parquet"
             print(f"  [{_ts()}] === Source [{s_i}/{len(sources)}]: {src.upper()} ({eff_start} -> {pad_end}) ===", flush=True)
             if src_cache.exists():
                 cdf = pd.read_parquet(src_cache)
-                print(f"  [{_ts()}] [{src.upper()}] Cache HIT -> {src_cache.name} ({len(cdf):,} rows)", flush=True)
+                print(f"  [{_ts()}] [{src.upper()}] Full Cache HIT -> {src_cache.name} ({len(cdf):,} rows)", flush=True)
                 collected[src] = cdf
                 continue
 
-            if src == "era5":
-                df_out, is_complete = _fetch_batched_multi_station_chunks(
-                    session, "era5", OPEN_METEO_ARCHIVE_URL, stations_df,
-                    eff_start, pad_end, ERA5_HOURLY_VARS, ERA5_HOURLY_VARS,
-                    chunk_dir, chunk_months=12, sleep_sec=0.8,
-                    allow_partial_on_daily_cap=(source_mode == "era5"),
+            url, req_vars, canon_vars, extra_p, c_months, slp, allow_part = src_spec_map[src]
+            salvaged_df, missing_sids = _salvage_cached_stations(
+                raw_dir, chunk_dir_v3, src, eff_start, pad_end, sids_sorted, canon_vars
+            )
+            if salvaged_df is not None and not salvaged_df.empty:
+                n_salv = salvaged_df["station_id"].nunique()
+                print(
+                    f"  [{_ts()}] [{src.upper()}] Reused {n_salv}/{len(sids_sorted)} stations from prior cache (0 API credits)! "
+                    f"Delta stations needed: {len(missing_sids)}",
+                    flush=True,
                 )
-            elif src == "gfs_hist":
-                df_out, is_complete = _fetch_batched_multi_station_chunks(
-                    session, "gfs_hist", OPEN_METEO_HIST_FORECAST_URL, stations_df,
-                    eff_start, pad_end, HIST_SUPPLEMENT_VARS, HIST_SUPPLEMENT_VARS,
-                    chunk_dir, extra_params={"models": "gfs_seamless"}, chunk_months=8, sleep_sec=0.9,
-                )
-            elif src == "prev_hrrr":
-                v_req = _build_prev_runs_var_list(1, compact=False)
-                df_out, is_complete = _fetch_batched_multi_station_chunks(
-                    session, "prev_hrrr", OPEN_METEO_PREV_RUNS_URL, stations_df,
-                    eff_start, pad_end, v_req, v_req,
-                    chunk_dir, extra_params={"models": "ncep_hrrr_conus"}, chunk_months=6, sleep_sec=1.0,
-                )
-            elif src == "prev_gfs":
-                v_surf = _build_prev_runs_var_list(4, compact=False)
-                df_out, is_complete = _fetch_batched_multi_station_chunks(
-                    session, "prev_gfs", OPEN_METEO_PREV_RUNS_URL, stations_df,
-                    eff_start, pad_end, v_surf, v_surf,
-                    chunk_dir, extra_params={"models": "gfs_seamless"}, chunk_months=4, sleep_sec=1.0,
-                )
-            elif src == "prev_ifs":
-                v_comp = _build_prev_runs_var_list(4, compact=True)
-                v_canon = _build_prev_runs_var_list(4, compact=False)
-                df_out, is_complete = _fetch_batched_multi_station_chunks(
-                    session, "prev_ifs", OPEN_METEO_PREV_RUNS_URL, stations_df,
-                    eff_start, pad_end, v_comp, v_canon,
-                    chunk_dir, extra_params={"models": "ecmwf_ifs"}, chunk_months=6, sleep_sec=1.0,
-                    allow_partial_on_daily_cap=True,
-                )
-            elif src == "prev_nbm":
-                v_comp = _build_prev_runs_var_list(4, compact=True)
-                v_canon = _build_prev_runs_var_list(4, compact=False)
-                df_out, is_complete = _fetch_batched_multi_station_chunks(
-                    session, "prev_nbm", OPEN_METEO_PREV_RUNS_URL, stations_df,
-                    eff_start, pad_end, v_comp, v_canon,
-                    chunk_dir, extra_params={"models": "ncep_nbm_conus"}, chunk_months=6, sleep_sec=1.0,
-                    allow_partial_on_daily_cap=True,
-                )
-            else:
-                raise ValueError(f"Unknown source: {src}")
 
-            if is_complete and not df_out.empty:
-                df_out.to_parquet(src_cache, index=False)
-            if not df_out.empty:
-                collected[src] = df_out
+            if not missing_sids:
+                full_df = salvaged_df.sort_values(["station_id", "time_utc"]).reset_index(drop=True)
+                full_df.to_parquet(src_cache, index=False)
+                collected[src] = full_df
+                continue
+
+            delta_st_df = stations_df[stations_df["station_id"].isin(missing_sids)].reset_index(drop=True)
+            delta_df, is_complete = _fetch_batched_multi_station_chunks(
+                session, src, url, delta_st_df, eff_start, pad_end,
+                req_vars, canon_vars, chunk_dir_v4, extra_params=extra_p,
+                chunk_months=c_months, sleep_sec=slp, allow_partial_on_daily_cap=allow_part,
+            )
+
+            parts = [p for p in (salvaged_df, delta_df) if p is not None and not p.empty]
+            if parts:
+                comb_df = (
+                    pd.concat(parts, ignore_index=True)
+                    .drop_duplicates(subset=["station_id", "time_utc"])
+                    .sort_values(["station_id", "time_utc"])
+                    .reset_index(drop=True)
+                )
+                if is_complete and comb_df["station_id"].nunique() == len(sids_sorted):
+                    comb_df.to_parquet(src_cache, index=False)
+                collected[src] = comb_df
 
     return collected
 
@@ -852,6 +912,11 @@ def fetch_hourly_predictors_for_stations(
 def fetch_live_operational_inputs(
     stations_df: pd.DataFrame,
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    Lightweight Daily Operational Fetch (~106.6 Open-Meteo credits = 1.07% of daily limit!):
+      - Pulls 7-day live GFS, ECMWF IFS, 3km HRRR, and 2.5km NBM grids
+      - Pulls live GFS + MEX + NBS/NBE MOS JSON bulletins across all FGZ airports (Days 1-5)
+    """
     sids = stations_df["station_id"].tolist()
     lats_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lat"])
     lons_csv = ",".join(f"{float(x):.4f}" for x in stations_df["lon"])
@@ -884,7 +949,7 @@ def fetch_live_operational_inputs(
                 "models": mod_code,
             }
             try:
-                payload = _request_open_meteo_json(session, f"live_{key}", OPEN_METEO_LIVE_FORECAST_URL, params, retries=3)
+                payload = _request_open_meteo_json(session, f"live_{key}", OPEN_METEO_LIVE_FORECAST_URL, params, retries=4)
                 items = payload if isinstance(payload, list) else [payload]
                 dfs = []
                 for sid, item in zip(sids, items):
@@ -900,36 +965,49 @@ def fetch_live_operational_inputs(
             except Exception as exc:
                 print(f"    [{_ts()}] [Live {key}] skipped ({type(exc).__name__})", flush=True)
 
-    mos_rows: list[dict[str, Any]] = []
-    today_utc = pd.Timestamp(datetime.now(timezone.utc).date())
+    mos_rows: list[pd.DataFrame] = []
+    today_mst = (pd.Timestamp(datetime.now(timezone.utc)) - pd.Timedelta(hours=7)).floor("D").tz_localize(None)
+
     for m_id in sorted(stations_df["mos_id"].dropna().unique().tolist()):
-        try:
-            r = requests.get(IEM_MOS_LIVE_URL, params={"station": m_id, "model": "GFS"}, timeout=20)
-            if r.status_code == 200:
-                entries = r.json().get("data", [])
-                if entries:
-                    mdf = pd.DataFrame(entries)
-                    mdf["ftime_utc"] = pd.to_datetime(mdf["ftime"], utc=True, errors="coerce").dt.tz_localize(None)
-                    mdf["target_date"] = (mdf["ftime_utc"] - pd.Timedelta(hours=7)).dt.floor("D")
-                    mdf["tmp_num"] = pd.to_numeric(mdf.get("tmp", np.nan), errors="coerce")
-                    mdf["nx_num"] = pd.to_numeric(mdf.get("n_x", np.nan), errors="coerce")
-                    mdf["dpt_num"] = pd.to_numeric(mdf.get("dpt", np.nan), errors="coerce")
-                    mdf["wsp_num"] = pd.to_numeric(mdf.get("wsp", np.nan), errors="coerce")
-                    grp = mdf.groupby("target_date", as_index=False).agg(
-                        mos_tmin_3h=("tmp_num", "min"),
-                        mos_tmax_3h=("tmp_num", "max"),
-                        mos_nx_min=("nx_num", "min"),
-                        mos_nx_max=("nx_num", "max"),
-                        mos_dpt_mean=("dpt_num", "mean"),
-                        mos_wsp_mean=("wsp_num", "mean"),
-                    )
-                    grp["mos_tmin_f"] = grp["mos_nx_min"].combine_first(grp["mos_tmin_3h"])
-                    grp["mos_tmax_f"] = grp["mos_nx_max"].combine_first(grp["mos_tmax_3h"])
-                    grp["mos_id"] = m_id
-                    grp["issue_date"] = today_utc
-                    mos_rows.append(grp[["mos_id", "issue_date", "target_date", "mos_tmin_f", "mos_tmax_f", "mos_dpt_mean", "mos_wsp_mean"]])
-        except Exception:
-            continue
+        st_m_parts: list[pd.DataFrame] = []
+        for prio, mod_code in enumerate(("GFS", "NBS", "MEX", "NBE")):
+            try:
+                r = requests.get(IEM_MOS_LIVE_URL, params={"station": m_id, "model": mod_code}, timeout=15)
+                if r.status_code == 200:
+                    entries = r.json().get("data", [])
+                    if entries:
+                        mdf = pd.DataFrame(entries)
+                        mdf["ftime_utc"] = pd.to_datetime(mdf["ftime"], utc=True, errors="coerce").dt.tz_localize(None)
+                        mdf["target_date"] = (mdf["ftime_utc"] - pd.Timedelta(hours=7)).dt.floor("D")
+                        mdf["tmp_num"] = pd.to_numeric(mdf.get("tmp", np.nan), errors="coerce")
+                        mdf["nx_num"] = pd.to_numeric(mdf.get("n_x", np.nan), errors="coerce")
+                        if "x_n" in mdf.columns:
+                            mdf["nx_num"] = mdf["nx_num"].combine_first(pd.to_numeric(mdf["x_n"], errors="coerce"))
+                        mdf["dpt_num"] = pd.to_numeric(mdf.get("dpt", np.nan), errors="coerce")
+                        mdf["wsp_num"] = pd.to_numeric(mdf.get("wsp", np.nan), errors="coerce")
+                        grp = mdf.groupby("target_date", as_index=False).agg(
+                            mos_tmin_3h=("tmp_num", "min"),
+                            mos_tmax_3h=("tmp_num", "max"),
+                            mos_nx_min=("nx_num", "min"),
+                            mos_nx_max=("nx_num", "max"),
+                            mos_dpt_mean=("dpt_num", "mean"),
+                            mos_wsp_mean=("wsp_num", "mean"),
+                        )
+                        grp["mos_tmin_f"] = grp["mos_nx_min"].combine_first(grp["mos_tmin_3h"])
+                        grp["mos_tmax_f"] = grp["mos_nx_max"].combine_first(grp["mos_tmax_3h"])
+                        grp["mos_id"] = m_id
+                        grp["issue_date"] = today_mst
+                        grp["_p"] = prio
+                        st_m_parts.append(grp[["mos_id", "issue_date", "target_date", "mos_tmin_f", "mos_tmax_f", "mos_dpt_mean", "mos_wsp_mean", "_p"]])
+            except Exception:
+                continue
+        if st_m_parts:
+            mos_rows.append(
+                pd.concat(st_m_parts, ignore_index=True)
+                .sort_values(["target_date", "_p"])
+                .drop_duplicates(subset=["mos_id", "target_date"], keep="first")
+                .drop(columns=["_p"])
+            )
 
     live_mos_df = (
         pd.concat(mos_rows, ignore_index=True)
